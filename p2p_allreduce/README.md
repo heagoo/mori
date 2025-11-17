@@ -2,6 +2,13 @@
 
 A high-performance, standalone AllReduce implementation using direct P2P (peer-to-peer) memory access via HIP IPC (Inter-Process Communication). This project is inspired by code patterns from the MORI project but is completely independent and self-contained.
 
+## Documentation
+
+- **[QUICKSTART.md](QUICKSTART.md)** - Get started in 5 minutes
+- **[BUILD.md](BUILD.md)** - Detailed build and installation instructions  
+- **[DESIGN.md](DESIGN.md)** - Technical design, algorithms, and optimizations
+- **README.md** (this file) - Overview and API reference
+
 ## Features
 
 - **Direct P2P Memory Access**: Uses HIP IPC for zero-copy data transfer between GPUs
