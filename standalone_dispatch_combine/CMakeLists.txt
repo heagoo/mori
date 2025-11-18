@@ -55,14 +55,22 @@ target_link_libraries(example
     hip::host
 )
 
+# Benchmark executable
+add_executable(benchmark examples/benchmark.cpp)
+target_link_libraries(benchmark
+    dispatch_combine
+    ${MPI_CXX_LIBRARIES}
+    hip::host
+)
+
 # Set RPATH for shared library
-set_target_properties(example PROPERTIES
+set_target_properties(example benchmark PROPERTIES
     INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib"
     BUILD_WITH_INSTALL_RPATH FALSE
 )
 
 # Install targets
-install(TARGETS dispatch_combine example
+install(TARGETS dispatch_combine example benchmark
     LIBRARY DESTINATION lib
     RUNTIME DESTINATION bin
 )
