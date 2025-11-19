@@ -60,6 +60,7 @@ __global__ void ComputeSendRecvCountsKernel(
 
 // Dispatch kernel using P2P for intra-node communication
 // This kernel directly writes to peer GPU memory
+// Based on EpDispatchIntraNodeKernel from the parent mori project
 __global__ void DispatchIntraNodeKernel(
     const float* input_tokens,       // [num_tokens, hidden_dim]
     const int32_t* expert_ids,       // [num_tokens, num_experts_per_token]
@@ -69,29 +70,70 @@ __global__ void DispatchIntraNodeKernel(
     int num_experts_per_rank,
     int hidden_dim,
     int rank,
-    int32_t* send_offsets)           // [world_size] - current write offset for each peer
+    int32_t* send_offsets,           // [world_size] - current write offset for each peer
+    int32_t* dispatch_map,           // [num_tokens * num_experts_per_token] - mapping info
+    int32_t* dest_token_counter,     // [world_size] - atomic counters for destination indices
+    size_t max_tokens_to_send)       // Maximum tokens that can be sent
 {
-    int token_idx = blockIdx.x;
-    int expert_slot = blockIdx.y;
+    int laneId = threadIdx.x & (warpSize - 1);
+    int warpId = threadIdx.x / warpSize;
+    int warpNum = blockDim.x / warpSize;
+    int globalWarpId = blockIdx.x * warpNum + warpId;
+    int globalWarpNum = gridDim.x * warpNum;
     
-    if (token_idx >= num_tokens || expert_slot >= num_experts_per_token) return;
-    
-    int expert_id = expert_ids[token_idx * num_experts_per_token + expert_slot];
-    int dest_rank = GetExpertRank(expert_id, num_experts_per_rank);
-    
-    // Get write position in destination buffer
-    int write_offset = atomicAdd(&send_offsets[dest_rank], 1);
-    
-    // Get destination pointer (peer GPU memory via P2P)
-    float* dest_buffer = reinterpret_cast<float*>(peer_ptrs[dest_rank]);
-    float* dest_token = dest_buffer + write_offset * hidden_dim;
-    
-    // Get source pointer
-    const float* src_token = input_tokens + token_idx * hidden_dim;
-    
-    // Copy token data using cooperative threads
-    for (int i = threadIdx.x; i < hidden_dim; i += blockDim.x) {
-        dest_token[i] = src_token[i];
+    // Each warp processes token-expert pairs
+    for (int i = globalWarpId; i < num_tokens * num_experts_per_token; i += globalWarpNum) {
+        int token_idx = i / num_experts_per_token;
+        int expert_slot = i % num_experts_per_token;
+        
+        int expert_id = expert_ids[i];
+        int dest_rank = expert_id / num_experts_per_rank;
+        
+        // Deduplication: check if this token already being sent to this destination
+        // by another expert slot (avoids sending same token multiple times)
+        bool is_duplicate = false;
+        if (laneId < expert_slot) {
+            int other_expert = expert_ids[token_idx * num_experts_per_token + laneId];
+            int other_rank = other_expert / num_experts_per_rank;
+            if (other_rank == dest_rank) {
+                is_duplicate = true;
+            }
+        }
+        
+        // Use warp vote to check if any lane found a duplicate
+        unsigned int dup_mask = __ballot(is_duplicate);
+        if (dup_mask != 0) {
+            // Mark this as duplicate in dispatch_map (use overflow value)
+            if (laneId == 0) {
+                dispatch_map[i] = max_tokens_to_send; // Overflow marker
+            }
+            continue;
+        }
+        
+        // Lane 0 of warp handles atomic operations
+        int dest_token_idx = 0;
+        if (laneId == 0) {
+            // Atomically get next available slot in destination buffer
+            dest_token_idx = atomicAdd(&dest_token_counter[dest_rank], 1);
+            
+            // Record mapping: global position = dest_rank * max_per_rank + local_idx
+            dispatch_map[i] = dest_rank * max_tokens_to_send + dest_token_idx;
+        }
+        
+        // Broadcast dest_token_idx to all lanes in warp
+        dest_token_idx = __shfl(dest_token_idx, 0);
+        
+        // Get destination pointer (peer GPU memory via P2P)
+        float* dest_buffer = reinterpret_cast<float*>(peer_ptrs[dest_rank]);
+        float* dest_token = dest_buffer + dest_token_idx * hidden_dim;
+        
+        // Get source pointer
+        const float* src_token = input_tokens + token_idx * hidden_dim;
+        
+        // Warp-level copy: all threads in warp cooperatively copy the token
+        for (int dim = laneId; dim < hidden_dim; dim += warpSize) {
+            dest_token[dim] = src_token[dim];
+        }
     }
 }
 
@@ -136,45 +178,69 @@ __global__ void DispatchInterNodeKernel(
 }
 
 // Combine kernel - aggregate expert outputs with weighted sum
+// Uses the dispatch_map to locate expert outputs
 __global__ void CombineKernel(
     const float* dispatch_buffer,    // [world_size * max_tokens, hidden_dim]
     const float* weights,            // [num_tokens, num_experts_per_token]
     const int32_t* expert_ids,       // [num_tokens, num_experts_per_token]
     float* output,                   // [num_tokens, hidden_dim]
-    const int32_t* recv_offsets,     // [world_size] - where tokens from each rank start
+    const int32_t* dispatch_map,     // [num_tokens * num_experts_per_token] - mapping info
     int num_tokens,
     int num_experts_per_token,
     int num_experts_per_rank,
     int hidden_dim,
-    int rank)
+    int rank,
+    size_t max_tokens_to_send)       // Maximum tokens per rank
 {
     int token_idx = blockIdx.x;
-    int dim_idx = threadIdx.x;
+    int warpId = threadIdx.x / warpSize;
+    int laneId = threadIdx.x % warpSize;
+    int warpNum = blockDim.x / warpSize;
     
-    if (token_idx >= num_tokens || dim_idx >= hidden_dim) return;
+    if (token_idx >= num_tokens) return;
     
-    float sum = 0.0f;
-    float weight_sum = 0.0f;
+    // Calculate dimensions per warp
+    int warps_per_token = 1;  // Simple case: one warp per token
+    int dims_per_warp = (hidden_dim + warpSize - 1) / warpSize;
     
-    // Aggregate outputs from all experts assigned to this token
-    for (int expert_slot = 0; expert_slot < num_experts_per_token; expert_slot++) {
-        int expert_id = expert_ids[token_idx * num_experts_per_token + expert_slot];
-        int src_rank = GetExpertRank(expert_id, num_experts_per_rank);
-        float weight = weights[token_idx * num_experts_per_token + expert_slot];
+    // Process each dimension assigned to this thread
+    for (int dim = laneId; dim < hidden_dim; dim += warpSize) {
+        float sum = 0.0f;
+        float weight_sum = 0.0f;
         
-        // Find where this token's expert output is in the dispatch buffer
-        // This requires tracking which tokens were sent to which experts
-        // For simplicity, we assume sequential ordering
-        int buffer_offset = recv_offsets[src_rank] + token_idx;
-        float expert_output = dispatch_buffer[buffer_offset * hidden_dim + dim_idx];
+        // Aggregate outputs from all experts assigned to this token
+        for (int expert_slot = 0; expert_slot < num_experts_per_token; expert_slot++) {
+            int map_idx = token_idx * num_experts_per_token + expert_slot;
+            int dest_location = dispatch_map[map_idx];
+            
+            // Check if this was a duplicate (marked with overflow value)
+            if (dest_location >= max_tokens_to_send) {
+                continue;  // Skip duplicates
+            }
+            
+            // Extract rank and local token index from mapping
+            int dest_rank = dest_location / max_tokens_to_send;
+            int local_token_idx = dest_location % max_tokens_to_send;
+            
+            // Read expert output from dispatch buffer
+            // Note: In real implementation, would read from peer memory using dispatch_map
+            // For now, assume data is in local dispatch_buffer after synchronization
+            float expert_output = dispatch_buffer[dest_location * hidden_dim + dim];
+            
+            // Get routing weight for this expert
+            float weight = weights[token_idx * num_experts_per_token + expert_slot];
+            
+            // Accumulate weighted output
+            sum += weight * expert_output;
+            weight_sum += weight;
+        }
         
-        sum += weight * expert_output;
-        weight_sum += weight;
-    }
-    
-    // Normalize by weight sum and write output
-    if (weight_sum > 0.0f) {
-        output[token_idx * hidden_dim + dim_idx] = sum / weight_sum;
+        // Normalize and write output
+        if (weight_sum > 0.0f) {
+            output[token_idx * hidden_dim + dim] = sum / weight_sum;
+        } else {
+            output[token_idx * hidden_dim + dim] = 0.0f;
+        }
     }
 }
 
@@ -191,17 +257,29 @@ extern "C" void LaunchDispatchKernels(
     int world_size,
     int gpu_per_node,
     int32_t* send_offsets,
+    int32_t* dispatch_map,
+    int32_t* dest_token_counter,
+    size_t max_tokens_to_send,
     hipStream_t stream)
 {
-    // Launch dispatch kernel with 2D grid: tokens x experts_per_token
-    dim3 grid(num_tokens, num_experts_per_token);
-    dim3 block(256); // 256 threads per block
+    // Calculate grid dimensions
+    // Each warp processes multiple token-expert pairs
+    int num_dispatches = num_tokens * num_experts_per_token;
+    int threads_per_block = 256;
+    int warps_per_block = threads_per_block / 32;
+    int num_warps = (num_dispatches + 31) / 32;  // Round up
+    int num_blocks = (num_warps + warps_per_block - 1) / warps_per_block;
     
-    // For simplicity, use P2P kernel (in full implementation, would check topology)
+    dim3 grid(num_blocks);
+    dim3 block(threads_per_block);
+    
+    // Launch intra-node dispatch kernel
+    // In production, would check topology and use appropriate kernel for inter-node
     hipLaunchKernelGGL(DispatchIntraNodeKernel, grid, block, 0, stream,
                        input_tokens, expert_ids, peer_ptrs,
                        num_tokens, num_experts_per_token, num_experts_per_rank,
-                       hidden_dim, rank, send_offsets);
+                       hidden_dim, rank, send_offsets, dispatch_map,
+                       dest_token_counter, max_tokens_to_send);
 }
 
 // Host function to launch combine
@@ -210,21 +288,23 @@ extern "C" void LaunchCombineKernel(
     const float* weights,
     const int32_t* expert_ids,
     float* output,
-    const int32_t* recv_offsets,
+    const int32_t* dispatch_map,
     int num_tokens,
     int num_experts_per_token,
     int num_experts_per_rank,
     int hidden_dim,
     int rank,
+    size_t max_tokens_to_send,
     hipStream_t stream)
 {
+    // One block per token, multiple threads per block
     dim3 grid(num_tokens);
-    dim3 block(256); // Use 256 threads per token
+    dim3 block(256);  // Use 256 threads (8 warps) per block
     
     hipLaunchKernelGGL(CombineKernel, grid, block, 0, stream,
-                       dispatch_buffer, weights, expert_ids, output, recv_offsets,
+                       dispatch_buffer, weights, expert_ids, output, dispatch_map,
                        num_tokens, num_experts_per_token, num_experts_per_rank,
-                       hidden_dim, rank);
+                       hidden_dim, rank, max_tokens_to_send);
 }
 
 } // namespace simple_dispatch_combine

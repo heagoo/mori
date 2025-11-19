@@ -118,10 +118,20 @@ private:
     // GPU work buffers
     int32_t* send_offsets_;    // Offsets for sending tokens to each rank
     int32_t* recv_offsets_;    // Offsets for receiving tokens from each rank
+    int32_t* send_counts_;     // Count of tokens to send to each rank
+    int32_t* recv_counts_;     // Count of tokens to receive from each rank
+    
+    // Mapping information for dispatch-combine coordination
+    int32_t* dispatch_map_;    // Maps token-expert pairs to destination buffer locations
+    int32_t* dest_token_counter_; // Atomic counters for destination token indices
+    
+    // Barrier and synchronization
+    uint32_t* dispatch_barrier_;   // Barrier for dispatch synchronization
+    uint32_t* combine_barrier_;    // Barrier for combine synchronization
+    uint32_t barrier_flag_;        // Current barrier flag value
     
     void AllocateBuffers();
     void FreeBuffers();
-    void ComputeSendRecvCounts();
 };
 
 } // namespace simple_dispatch_combine
