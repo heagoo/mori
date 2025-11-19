@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cstring>
 #include <iostream>
+#include <algorithm>
 
 namespace simple_dispatch_combine {
 
@@ -47,6 +48,7 @@ void DispatchCombineContext::Initialize() {
     if (initialized_) return;
     
     InitializeMPI();
+    // TODO:
     // InitializeRDMA(); // Simplified - would initialize ibverbs in full implementation
     
     initialized_ = true;
@@ -214,7 +216,7 @@ void DispatchCombineContext::FreeSymmetricMemory(SymmetricMemory* mem) {
 
 DispatchCombineHandle::DispatchCombineHandle(DispatchCombineContext* ctx)
     : ctx_(ctx), config_(ctx->GetConfig()),
-      input_tokens_(nullptr), expert_ids_(nullptr), weights_(nullptr), num_tokens_(0),
+      hidden_states_(nullptr), expert_ids_(nullptr), weights_(nullptr), num_tokens_(0),
       dispatch_buffer_(nullptr), output_buffer_(nullptr), token_counts_(nullptr),
       send_offsets_(nullptr), recv_offsets_(nullptr) {
     
@@ -271,9 +273,9 @@ void DispatchCombineHandle::FreeBuffers() {
     }
 }
 
-void DispatchCombineHandle::PrepareInference(void* tokens, int32_t* expert_ids,
+void DispatchCombineHandle::PrepareInference(void* states, int32_t* expert_ids,
                                             float* weights, int num_tokens) {
-    input_tokens_ = tokens;
+    hidden_states_ = states;
     expert_ids_ = expert_ids;
     weights_ = weights;
     num_tokens_ = num_tokens;

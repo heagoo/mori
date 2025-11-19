@@ -84,10 +84,10 @@ public:
     ~DispatchCombineHandle();
     
     // Prepare buffers for inference
-    // tokens: [num_tokens, hidden_dim] input tokens on this rank
+    // states: [num_tokens, hidden_dim] input hidden states on this rank
     // expert_ids: [num_tokens, num_experts_per_token] expert assignments
     // weights: [num_tokens, num_experts_per_token] weights for combining
-    void PrepareInference(void* tokens, int32_t* expert_ids, float* weights, int num_tokens);
+    void PrepareInference(void* states, int32_t* expert_ids, float* weights, int num_tokens);
     
     // Dispatch phase: send tokens to appropriate expert ranks
     // Uses P2P for intra-node, RDMA for inter-node
@@ -105,7 +105,7 @@ private:
     Config config_;
     
     // User provided buffers
-    void* input_tokens_;
+    void* hidden_states_;
     int32_t* expert_ids_;
     float* weights_;
     int num_tokens_;

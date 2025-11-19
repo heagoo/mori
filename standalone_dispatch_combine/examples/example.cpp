@@ -10,17 +10,17 @@
 using namespace simple_dispatch_combine;
 
 // Helper function to initialize test data
-void InitializeTestData(float* tokens, int32_t* expert_ids, float* weights,
+void InitializeTestData(float* hidden_states, int32_t* expert_ids, float* weights,
                        int num_tokens, int hidden_dim, int num_experts_per_token,
                        int num_experts, int seed) {
     std::mt19937 gen(seed);
     std::uniform_real_distribution<float> token_dist(0.0f, 1.0f);
     std::uniform_int_distribution<int> expert_dist(0, num_experts - 1);
-    std::uniform_real_distribution<float> weight_dist(0.5f, 1.0f);
+    std::uniform_real_distribution<float> weight_dist(0.0f, 1.0f);
     
     // Initialize tokens with random values
     for (int i = 0; i < num_tokens * hidden_dim; i++) {
-        tokens[i] = token_dist(gen);
+        hidden_states[i] = token_dist(gen);
     }
     
     // Initialize expert assignments
@@ -37,8 +37,9 @@ void InitializeTestData(float* tokens, int32_t* expert_ids, float* weights,
             sum += w;
         }
         // Normalize
+        float inv_sum = 1.0f / sum;
         for (int j = 0; j < num_experts_per_token; j++) {
-            weights[i * num_experts_per_token + j] /= sum;
+            weights[i * num_experts_per_token + j] *= inv_sum;
         }
     }
 }
@@ -68,8 +69,8 @@ int main(int argc, char** argv) {
     // Parse command line arguments (simple version)
     int hidden_dim = 4096;
     int max_tokens_per_rank = 128;
-    int num_experts_per_rank = 8;
-    int num_experts_per_token = 2;
+    int num_experts_per_rank = 32;
+    int num_experts_per_token = 8;
     int gpu_per_node = 8;
     int num_warmup = 5;
     int num_iterations = 10;
@@ -110,7 +111,7 @@ int main(int argc, char** argv) {
     int num_tokens = max_tokens_per_rank;
     int num_experts = world_size * num_experts_per_rank;
     
-    float* d_tokens;
+    float* d_hidden_states;
     int32_t* d_expert_ids;
     float* d_weights;
     
@@ -118,25 +119,25 @@ int main(int argc, char** argv) {
     size_t expert_ids_size = num_tokens * num_experts_per_token * sizeof(int32_t);
     size_t weights_size = num_tokens * num_experts_per_token * sizeof(float);
     
-    hipMalloc(&d_tokens, tokens_size);
+    hipMalloc(&d_hidden_states, tokens_size);
     hipMalloc(&d_expert_ids, expert_ids_size);
     hipMalloc(&d_weights, weights_size);
     
     // Initialize on host then copy to device
-    std::vector<float> h_tokens(num_tokens * hidden_dim);
+    std::vector<float> h_hidden_states(num_tokens * hidden_dim);
     std::vector<int32_t> h_expert_ids(num_tokens * num_experts_per_token);
     std::vector<float> h_weights(num_tokens * num_experts_per_token);
     
-    InitializeTestData(h_tokens.data(), h_expert_ids.data(), h_weights.data(),
+    InitializeTestData(h_hidden_states.data(), h_expert_ids.data(), h_weights.data(),
                       num_tokens, hidden_dim, num_experts_per_token, num_experts,
-                      rank + 42);
+                      rank + 128);
     
-    hipMemcpy(d_tokens, h_tokens.data(), tokens_size, hipMemcpyHostToDevice);
+    hipMemcpy(d_hidden_states, h_hidden_states.data(), tokens_size, hipMemcpyHostToDevice);
     hipMemcpy(d_expert_ids, h_expert_ids.data(), expert_ids_size, hipMemcpyHostToDevice);
     hipMemcpy(d_weights, h_weights.data(), weights_size, hipMemcpyHostToDevice);
     
     // Prepare inference
-    handle.PrepareInference(d_tokens, d_expert_ids, d_weights, num_tokens);
+    handle.PrepareInference(d_hidden_states, d_expert_ids, d_weights, num_tokens);
     
     // Warmup iterations
     if (rank == 0) std::cout << "\nWarming up..." << std::endl;
@@ -209,7 +210,7 @@ int main(int argc, char** argv) {
     }
     
     // Cleanup
-    hipFree(d_tokens);
+    hipFree(d_hidden_states);
     hipFree(d_expert_ids);
     hipFree(d_weights);
     hipEventDestroy(start);
