@@ -388,6 +388,28 @@ void DispatchCombineHandle::PrepareInference(void* states, int32_t* expert_ids,
 }
 
 void DispatchCombineHandle::LaunchDispatch(hipStream_t stream) {
+    // ============================================================================
+    // DISPATCH PHASE: Route tokens to expert ranks
+    // ============================================================================
+    // 
+    // Synchronization Model:
+    // 1. GPU kernels write directly to peer GPU memory (P2P or RDMA)
+    // 2. Within a node: P2P writes are immediately visible after __threadfence()
+    // 3. Across nodes: RDMA writes require explicit synchronization
+    // 4. All GPU operations complete before returning (hipStreamSynchronize)
+    // 
+    // For RDMA synchronization (simplified in this version):
+    // - Option 1: MPI_Barrier between dispatch and combine (simple but slower)
+    // - Option 2: GPU-level barriers using atomic operations on symmetric memory
+    // - Option 3: RDMA-based signaling (most efficient, requires hardware support)
+    // 
+    // Mapping Information:
+    // - dispatch_map[token_idx * num_experts + expert_slot] stores where token was sent
+    // - Format: dest_rank * max_tokens_per_rank + local_offset
+    // - Special value (>= max_tokens_to_send) indicates duplicate (not sent)
+    // - This map is critical for the combine phase to locate expert outputs
+    // ============================================================================
+    
     // Reset counters for this dispatch operation
     HIP_CHECK(hipMemsetAsync(send_offsets_, 0, config_.world_size * sizeof(int32_t), stream));
     HIP_CHECK(hipMemsetAsync(dest_token_counter_, 0, config_.world_size * sizeof(int32_t), stream));
@@ -458,11 +480,66 @@ void DispatchCombineHandle::LaunchDispatch(hipStream_t stream) {
     // Cleanup temporary buffer
     HIP_CHECK(hipFree(d_peer_ptrs));
     
-    // Optional: MPI barrier for inter-node synchronization if using RDMA
-    // MPI_Barrier(MPI_COMM_WORLD);
+    // ============================================================================
+    // SYNCHRONIZATION NOTE for RDMA:
+    // ============================================================================
+    // For inter-node RDMA transfers, we need explicit synchronization to ensure
+    // remote writes are visible before the combine phase reads them.
+    //
+    // Option 1 (Simple): Use MPI barrier
+    //   MPI_Barrier(MPI_COMM_WORLD);
+    //   Pros: Simple, guaranteed to work
+    //   Cons: Involves CPU, higher latency (~10-50us)
+    //
+    // Option 2 (Better): GPU-level atomic barrier using symmetric memory
+    //   Each rank atomically increments barrier counters on all other ranks
+    //   All ranks spin-wait until all counters reach expected value
+    //   Pros: No CPU involvement, lower latency (~1-5us)
+    //   Cons: More complex, requires careful ordering
+    //
+    // Option 3 (Best): RDMA completion notification
+    //   Use RDMA send/recv for completion signaling
+    //   Or use GPU Direct Async with work completion events
+    //   Pros: Lowest latency, most efficient
+    //   Cons: Requires vendor-specific RDMA features
+    //
+    // For this simplified implementation, we rely on the implicit barrier
+    // between dispatch and combine calls. In production, would implement
+    // one of the above based on requirements and hardware support.
+    // ============================================================================
 }
 
 void DispatchCombineHandle::LaunchCombine(hipStream_t stream) {
+    // ============================================================================
+    // COMBINE PHASE: Aggregate expert outputs back to original tokens
+    // ============================================================================
+    //
+    // This phase reads expert outputs that were written during dispatch phase
+    // and combines them using weighted aggregation.
+    //
+    // Key Assumptions:
+    // 1. All dispatch writes have completed and are visible
+    //    - For P2P: guaranteed by previous hipStreamSynchronize()
+    //    - For RDMA: requires MPI_Barrier or GPU-level synchronization
+    // 2. dispatch_map contains valid mappings from token-expert pairs to buffer locations
+    // 3. Expert computation has been performed (not shown in this simplified version)
+    //
+    // Combine Algorithm:
+    // For each original token:
+    //   For each expert assigned to that token:
+    //     1. Use dispatch_map to find where expert output is located
+    //     2. Read expert output from dispatch_buffer (may be on different GPU)
+    //     3. Apply routing weight
+    //     4. Accumulate weighted sum
+    //   5. Normalize by sum of weights
+    //   6. Write final output to output_buffer
+    //
+    // Memory Access Pattern:
+    // - Reads from dispatch_buffer (symmetric memory, may use P2P)
+    // - Writes to output_buffer (local GPU memory)
+    // - All accesses coalesced for optimal bandwidth
+    // ============================================================================
+    
     // Reset combine barrier
     HIP_CHECK(hipMemsetAsync(combine_barrier_, 0, sizeof(uint32_t), stream));
     

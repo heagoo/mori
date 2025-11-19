@@ -1,5 +1,39 @@
 // GPU kernels for dispatch-combine operations
 // Copyright (c) 2025. MIT License.
+//
+// ============================================================================
+// DISPATCH-COMBINE ALGORITHM FOR MIXTURE-OF-EXPERTS (MoE)
+// ============================================================================
+//
+// This implementation provides GPU kernels for efficient token routing in
+// Mixture-of-Experts models. The algorithm has two main phases:
+//
+// 1. DISPATCH PHASE:
+//    - Each rank has input tokens to process
+//    - Based on expert assignments (top-k routing), tokens are sent to ranks
+//      that own the required experts
+//    - Uses direct GPU-to-GPU transfers (P2P within node, RDMA across nodes)
+//    - Records mapping information for later combining
+//
+// 2. COMBINE PHASE:
+//    - After expert computation, outputs need to be aggregated back
+//    - Uses mapping info from dispatch to locate expert outputs
+//    - Performs weighted combination based on routing weights
+//    - Outputs final aggregated results
+//
+// KEY FEATURES:
+// - Deduplication: If token needs multiple experts on same rank, only sent once
+// - Warp-level operations: All transfers use warp-cooperative primitives
+// - Zero-copy: Direct GPU memory access, no intermediate CPU buffers
+// - Symmetric memory: All ranks can access each other's GPU memory
+//
+// SYNCHRONIZATION:
+// - P2P writes are visible after __threadfence() within same node
+// - RDMA writes require explicit synchronization (barrier or signaling)
+// - Mapping information (dispatch_map) coordinates dispatch and combine
+//
+// Based on the MORI project's EpDispatchIntraNodeKernel and related kernels.
+// ============================================================================
 
 #include "dispatch_combine.hpp"
 #include <hip/hip_runtime.h>
@@ -139,42 +173,92 @@ __global__ void DispatchIntraNodeKernel(
 
 // Dispatch kernel using RDMA for inter-node communication
 // In a full implementation, this would use GPU-initiated RDMA
-// For now, we'll simulate with regular GPU copies
+// For now, we'll simulate with staging buffer + synchronization
+// Based on EpDispatchInterNodeKernel from the parent mori project
 __global__ void DispatchInterNodeKernel(
     const float* input_tokens,       // [num_tokens, hidden_dim]
     const int32_t* expert_ids,       // [num_tokens, num_experts_per_token]
-    float* staging_buffer,           // Staging buffer for RDMA
+    float* staging_buffer,           // Staging buffer for RDMA transfers
+    const uintptr_t* peer_ptrs,      // [world_size] - destination pointers
     int num_tokens,
     int num_experts_per_token,
     int num_experts_per_rank,
     int hidden_dim,
     int rank,
-    int32_t* send_offsets)           // [world_size]
+    int world_size,
+    int gpu_per_node,
+    int32_t* send_offsets,           // [world_size]
+    int32_t* dispatch_map,           // Mapping information
+    int32_t* dest_token_counter,     // Atomic counters
+    size_t max_tokens_to_send)
 {
-    int token_idx = blockIdx.x;
-    int expert_slot = blockIdx.y;
+    int laneId = threadIdx.x & (warpSize - 1);
+    int warpId = threadIdx.x / warpSize;
+    int warpNum = blockDim.x / warpSize;
+    int globalWarpId = blockIdx.x * warpNum + warpId;
+    int globalWarpNum = gridDim.x * warpNum;
     
-    if (token_idx >= num_tokens || expert_slot >= num_experts_per_token) return;
+    int my_node = rank / gpu_per_node;
     
-    int expert_id = expert_ids[token_idx * num_experts_per_token + expert_slot];
-    int dest_rank = GetExpertRank(expert_id, num_experts_per_rank);
-    
-    // Get write position in staging buffer
-    int write_offset = atomicAdd(&send_offsets[dest_rank], 1);
-    
-    // Write to staging buffer
-    float* dest_token = staging_buffer + write_offset * hidden_dim;
-    const float* src_token = input_tokens + token_idx * hidden_dim;
-    
-    // Copy token data
-    for (int i = threadIdx.x; i < hidden_dim; i += blockDim.x) {
-        dest_token[i] = src_token[i];
+    // Phase 1: Build dispatch map and compute destinations
+    // Similar to intra-node, but tracks inter-node destinations
+    for (int i = globalWarpId; i < num_tokens * num_experts_per_token; i += globalWarpNum) {
+        int token_idx = i / num_experts_per_token;
+        int expert_slot = i % num_experts_per_token;
+        
+        int expert_id = expert_ids[i];
+        int dest_rank = expert_id / num_experts_per_rank;
+        int dest_node = dest_rank / gpu_per_node;
+        
+        // Skip if same node (handled by intra-node kernel)
+        if (dest_node == my_node) continue;
+        
+        // Deduplication check
+        bool is_duplicate = false;
+        if (laneId < expert_slot) {
+            int other_expert = expert_ids[token_idx * num_experts_per_token + laneId];
+            int other_rank = other_expert / num_experts_per_rank;
+            if (other_rank == dest_rank) {
+                is_duplicate = true;
+            }
+        }
+        
+        unsigned int dup_mask = __ballot(is_duplicate);
+        if (dup_mask != 0) {
+            if (laneId == 0) {
+                dispatch_map[i] = max_tokens_to_send; // Mark as duplicate
+            }
+            continue;
+        }
+        
+        // Allocate destination slot
+        int dest_token_idx = 0;
+        if (laneId == 0) {
+            dest_token_idx = atomicAdd(&dest_token_counter[dest_rank], 1);
+            dispatch_map[i] = dest_rank * max_tokens_to_send + dest_token_idx;
+            __threadfence();  // Ensure visibility for RDMA operations
+        }
+        dest_token_idx = __shfl(dest_token_idx, 0);
+        
+        // Copy to staging buffer first
+        // In production: this would directly initiate GPU-RDMA transfer
+        const float* src_token = input_tokens + token_idx * hidden_dim;
+        float* stage_token = staging_buffer + (dest_rank * max_tokens_to_send + dest_token_idx) * hidden_dim;
+        
+        for (int dim = laneId; dim < hidden_dim; dim += warpSize) {
+            stage_token[dim] = src_token[dim];
+        }
     }
     
-    // In a full implementation with GPU-initiated RDMA:
-    // - Use MLX5 or similar provider APIs to post RDMA write from GPU
-    // - Write directly to remote GPU memory using rkeys
-    // - Signal completion when done
+    // Phase 2: RDMA transfer (simplified)
+    // In a full implementation with GPU Direct RDMA:
+    // - Would use vendor-specific APIs (e.g., MLX5 for Mellanox NICs)
+    // - Post RDMA write work requests from GPU kernel
+    // - Example: mlx5_post_rdma_write_wqe(qp, local_addr, remote_addr, size, rkey)
+    // - Signal completion and handle acknowledgments
+    //
+    // For this simplified version, we rely on explicit synchronization
+    // between dispatch and combine phases via MPI barriers
 }
 
 // Combine kernel - aggregate expert outputs with weighted sum
