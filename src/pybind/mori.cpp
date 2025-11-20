@@ -268,6 +268,8 @@ void RegisterMoriOps(py::module_& m) {
                      &mori::moe::EpDispatchCombineConfig::numExpertPerToken)
       .def_readwrite("warp_num_per_block", &mori::moe::EpDispatchCombineConfig::warpNumPerBlock)
       .def_readwrite("block_num", &mori::moe::EpDispatchCombineConfig::blockNum)
+      .def_readwrite("use_external_inp_buffer",
+                     &mori::moe::EpDispatchCombineConfig::useExternalInpBuffer)
       .def_readwrite("gpu_per_node", &mori::moe::EpDispatchCombineConfig::gpuPerNode)
       .def_readwrite("rdma_block_num", &mori::moe::EpDispatchCombineConfig::rdmaBlockNum);
 
