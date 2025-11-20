@@ -246,49 +246,93 @@ class EpDispatchCombineHandle {
 template <typename T>
 struct EpDispatchCombineArgs {
   using data_type = T;
+  // Configuration parameters for dispatch/combine operations
   EpDispatchCombineConfig config;
+  // Number of tokens on this rank, updated at each round of inference
   index_t curRankNumToken{0};
+  // Routed expert indices for tokens
   index_t* tokenIndices{nullptr};
+  // Kernel input buffer for tokens
   T* inpTokenBuf{nullptr};
+  // Kernel output buffer for tokens
   T* outTokenBuf{nullptr};
+  // Per-token routing weights buffer
   float* weightsBuf{nullptr};
+  // Per-token quantization scales buffer
   uint8_t* scalesBuf{nullptr};
+  // Registered buffer for dispatch phase input tokens
   mori::application::SymmMemObjPtr shmemDispatchInpTokMemObj;
+  // Registered buffer for combine phase input tokens
   mori::application::SymmMemObjPtr shmemCombineInpTokMemObj;
+  // Registered buffer for dispatch phase output tokens
   mori::application::SymmMemObjPtr shmemDispatchOutTokMemObj;
+  // Registered buffer for combine phase output tokens
   mori::application::SymmMemObjPtr shmemCombineOutTokMemObj;
+  // Registered staging buffer for inter-node token transfers
   mori::application::SymmMemObjPtr shmemStagingTokMemObj;
+  // Registered buffer for input routing weights
   mori::application::SymmMemObjPtr shmemInpWeightsMemObj;
+  // Registered buffer for dispatch phase output weights
   mori::application::SymmMemObjPtr shmemDispatchOutWeightsMemObj;
+  // Registered buffer for combine phase output weights
   mori::application::SymmMemObjPtr shmemCombineOutWeightsMemObj;
+  // Registered buffer for input quantization scales
   mori::application::SymmMemObjPtr shmemInpScalesMemObj;
+  // Registered buffer for output quantization scales
   mori::application::SymmMemObjPtr shmemOutScalesMemObj;
+  // Registered buffer for input expert indices
   mori::application::SymmMemObjPtr shmemInpIndicesMemObj;
+  // Registered buffer for output expert indices
   mori::application::SymmMemObjPtr shmemOutIndicesMemObj;
+  // Record number of tokens that will be received from other PEs
   mori::application::SymmMemObjPtr recvTokenNumMemObj;
+  // Record number of tokens that will be sent to other PEs
   mori::application::SymmMemObjPtr sendTokenNumMemObj;
+  // Atomic signal for token send synchronization
   mori::application::SymmMemObjPtr sendAtomicSignalMemObj;
+  // Barrier for intra-grid synchronization in dispatch phase
   uint32_t* dispatchGridBarrier{nullptr};
+  // Barrier for intra-grid synchronization in combine phase
   uint32_t* combineGridBarrier{nullptr};
+  // Count the number of tokens sent to destination PE
   index_t* destPeTokenCounter{nullptr};
+  // Count the number of tokens sent to local PE
   index_t* localPeTokenCounter{nullptr};
+  // Map dispatch staging buffer index to output buffer index, saved at dispatch recv phase and used at combine send phase
   index_t* dispReceiverIdxMap{nullptr};
+  // Map dispatch input token index to staging buffer index, saved at dispatch send phase and used at combine recv phase
   index_t* dispSenderIdxMap{nullptr};
+  // Map staging buffer index to dispatch input token index, saved at dispatch init phase and used at dispatch send phase
   index_t* destPeTokenIdxMap{nullptr};
+  // Map output buffer index to combine input token index, saved at dispatch recv phase and used at combine send phase
   index_t* srcPeTokenIdxMap{nullptr};
+  // Registered buffer tracking token offset for each destination PE (intra-node)
   mori::application::SymmMemObjPtr dispTokOffsetMemObj;
+  // Registered buffer mapping destination token ID to source token ID (intra-node)
   mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
+  // Map dispatch token index to destination token ID (intra-node)
   index_t* dispDestTokIdMap{nullptr};
+  // Total number of tokens received across all PEs
   index_t* totalRecvTokenNum{nullptr};
+  // Registered buffer for cross-device barrier synchronization
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
+  // Flag value for cross-device barrier coordination
   uint32_t* crossDeviceBarrierFlag{nullptr};
+  // Signal the completion of inter-node token transfer chunks
   mori::application::SymmMemObjPtr interNodeChunkFlagMemObj;
+  // Count the number of tokens sent to other nodes
   index_t* destNodeTokenCounter{nullptr};
+  // Signal the number of tokens transferred from other nodes
   mori::application::SymmMemObjPtr nodeRecvTokenNumMemObj;
+  // Counter that is used to sort the ordering of inter-node token chunk transfer
   index_t* blockFlagCounter{nullptr};
+  // Barrier for blocks that perform inter-node RDMA transfer
   uint32_t* interNodeBlocksBarrier{nullptr};
+  // Map dispatch token index for inter-node tokens
   index_t* interNodeDispDestTokIdMap{nullptr};
+  // Barrier for RDMA block group coordination in combine phase
   index_t* interNodeChunkFlagCombine{nullptr};
+  // Map dispatched RDMA token chunk index for inter-node transfers
   index_t* interNodeDispSendMap{nullptr};
 };
 
