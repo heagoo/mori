@@ -72,21 +72,34 @@ using index_t = int32_t;
 
 #define MAX_EXPERTS_PER_TOKEN (8)
 struct EpDispatchCombineConfig {
+  // Process rank in the distributed system (0 to worldSize-1)
   int rank{0};
+  // Total number of processes/GPUs in the distributed system
   int worldSize{0};
+  // Hidden dimension size for tokens (e.g., 4096, 7168)
   int hiddenDim{4096};
+  // Scale dimension for FP8 quantization (0 if not using FP8)
   int scaleDim{32};
+  // Size of scale data type in bytes (1 for FP8, 4 for FP32)
   int scaleTypeSize{1};
+  // Maximum token data type size in bytes (used for buffer allocation)
   int maxTokenTypeSize{4};
+  // Maximum number of input tokens per rank
   int maxNumInpTokenPerRank{128};
+  // Number of experts assigned to each rank
   int numExpertPerRank{1};
+  // Number of experts each token is routed to (top-K)
   int numExpertPerToken{2};
+  // Number of warps per thread block for kernel execution
   int warpNumPerBlock{1};
+  // Number of thread blocks for kernel execution
   int blockNum{1};
   // If true, use external buffer which incurs extra copy overhead; otherwise, the kernel assumes
-  // the provided buffer is shmemInpTokMemObj
+  // the provided buffer is shmemInpTokMemObj (only relevant for IntraNode kernels)
   bool useExternalInpBuffer{true};
+  // Number of GPUs per node (used for inter-node communication)
   int gpuPerNode{8};
+  // Number of RDMA blocks for inter-node transfer
   int rdmaBlockNum{1};
 
   inline __host__ __device__ int MaxNumTokensToSendPerRank() const { return maxNumInpTokenPerRank; }
@@ -371,7 +384,8 @@ namespace std {
 static std::ostream& operator<<(std::ostream& s, mori::moe::EpDispatchCombineConfig config) {
   std::stringstream ss;
   ss << "EpDispatchCombineConfig: " << std::endl
-     << "  WorldSize: " << config.worldSize << std::endl
+     << "  rank: " << config.rank << std::endl
+     << "  worldSize: " << config.worldSize << std::endl
      << "  hiddenDim: " << config.hiddenDim << std::endl
      << "  scaleDim: " << config.scaleDim << std::endl
      << "  scaleTypeSize: " << config.scaleTypeSize << std::endl
@@ -380,7 +394,10 @@ static std::ostream& operator<<(std::ostream& s, mori::moe::EpDispatchCombineCon
      << "  numExpertPerRank: " << config.numExpertPerRank << std::endl
      << "  numExpertPerToken: " << config.numExpertPerToken << std::endl
      << "  warpNumPerBlock: " << config.warpNumPerBlock << std::endl
-     << "  blockNum: " << config.blockNum;
+     << "  blockNum: " << config.blockNum << std::endl
+     << "  useExternalInpBuffer: " << config.useExternalInpBuffer << std::endl
+     << "  gpuPerNode: " << config.gpuPerNode << std::endl
+     << "  rdmaBlockNum: " << config.rdmaBlockNum;
   s << ss.str();
   return s;
 }
