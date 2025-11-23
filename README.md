@@ -94,6 +94,15 @@ Benchmark result on the following configurations:
 
 - Session is a specific technique used in MORI-IO to reduce overhead
 
+## Documentation
+
+For detailed information about MORI components and APIs:
+
+- **[Dispatch/Combine Python Interface](docs/DISPATCH-COMBINE-PYTHON-INTERFACE.md)**: Comprehensive guide to the dispatch/combine calling stacks, buffer preparation, and RDMA setup
+- **[MORI-IO Introduction](docs/MORI-IO-INTRO.md)**: Overview of MORI-IO point-to-point communication
+- **[MORI-IO Benchmark](docs/MORI-IO-BENCHMARK.md)**: Performance benchmarks for MORI-IO
+- **[MORI-EP Benchmark](docs/MORI-EP-BENCHMARK.md)**: Performance benchmarks for MORI-EP
+
 ## Installation
 
 ### Prerequisites
