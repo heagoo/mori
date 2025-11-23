@@ -544,11 +544,13 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
 
 ### Combine Kernel Selection
 
-Similar to dispatch, based on `kernel_type`:
+Based on `kernel_type`:
 
 - **IntraNode**: `EpCombineIntraNodeKernel`
 - **InterNode**: `EpCombineInterNodeKernel`
 - **InterNodeV1/V1LL**: `EpCombineInterNodeV1Kernel`
+
+**Note**: Unlike dispatch kernels where InterNodeV1 and InterNodeV1LL use different implementations (`EpDispatchInterNodeV1Kernel` vs `EpDispatchInterNodeV1KernelLowLatency`), the combine operation uses the same kernel (`EpCombineInterNodeV1Kernel`) for both V1 and V1LL. This is because the combine phase has less performance variation between configurations, and the low-latency optimizations are primarily needed in the dispatch phase.
 
 ### Combine Kernel Execution (Conceptual)
 
