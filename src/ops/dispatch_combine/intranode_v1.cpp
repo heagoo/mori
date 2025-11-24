@@ -22,6 +22,9 @@
 
 #include "src/ops/dispatch_combine/intranode_v1.hpp"
 
+#include <hip/hip_bfloat16.h>
+#include <hip/hip_fp8.h>
+
 #include "mori/core/core.hpp"
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"
 #include "mori/shmem/shmem.hpp"
