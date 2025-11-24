@@ -53,6 +53,8 @@ __global__ void EpDispatchIntraNodeKernelV1(EpDispatchCombineArgs<T> args) {
   int npes = config.worldSize;
 
   size_t maxNumTokensToSend = config.MaxNumTokensToSend();
+  // Sentinel value to mark duplicate tokens (tokens already sent to same PE by earlier expert)
+  const index_t DUPLICATE_TOKEN_MARKER = config.worldSize * maxNumTokensToSend;
 
   // Shared memory to track token counts and starting positions per destination PE
   extern __shared__ char sharedMem[];
@@ -77,7 +79,8 @@ __global__ void EpDispatchIntraNodeKernelV1(EpDispatchCombineArgs<T> args) {
       index_t destExpert = args.tokenIndices[i];
       index_t destPe = destExpert / config.numExpertPerRank;
 
-      // Deduplicate
+      // Deduplicate: Skip if this token-expert pair goes to the same PE as an earlier expert
+      // for the same token (to avoid sending the same token multiple times to the same PE)
       assert(config.numExpertPerToken < warpSize);
       int condition = 0;
       if (laneId < (i % config.numExpertPerToken)) {
@@ -85,8 +88,8 @@ __global__ void EpDispatchIntraNodeKernelV1(EpDispatchCombineArgs<T> args) {
                                config.numExpertPerRank);
       }
       if (__any(condition)) {
-        // Indicate that this token is already sent to the destination PE
-        if (laneId == 0) args.dispDestTokIdMap[i] = config.worldSize * maxNumTokensToSend;
+        // Mark as duplicate so we skip it in the write phase
+        if (laneId == 0) args.dispDestTokIdMap[i] = DUPLICATE_TOKEN_MARKER;
         continue;
       }
 
@@ -121,11 +124,12 @@ __global__ void EpDispatchIntraNodeKernelV1(EpDispatchCombineArgs<T> args) {
       index_t destPe = destExpert / config.numExpertPerRank;
 
       // Skip duplicates (already marked in step 1)
-      if (laneId == 0 && args.dispDestTokIdMap[i] == config.worldSize * maxNumTokensToSend) {
+      if (laneId == 0 && args.dispDestTokIdMap[i] == DUPLICATE_TOKEN_MARKER) {
         continue;
       }
 
-      // Deduplicate check (same as before)
+      // Deduplicate check (same as in counting phase - needed to maintain consistent behavior
+      // across both passes since we process tokens in the same order)
       assert(config.numExpertPerToken < warpSize);
       int condition = 0;
       if (laneId < (i % config.numExpertPerToken)) {

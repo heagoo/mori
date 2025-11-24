@@ -268,7 +268,10 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
        config.numExpertPerRank) *
       sizeof(index_t);
   
-  // IntraNodeV1 needs different shared memory size
+  // IntraNodeV1 needs different shared memory size:
+  // - 2 arrays per warp: tokenCountPerPe and startIndexPerPe
+  // - Each array is size worldSize (number of destination PEs)
+  // - Total: 2 * worldSize * actualWarpNumPerBlock * sizeof(index_t)
   if (kernelType == KernelType::IntraNodeV1) {
     sharedMemSize = 2 * config.worldSize * actualWarpNumPerBlock * sizeof(index_t);
   }
