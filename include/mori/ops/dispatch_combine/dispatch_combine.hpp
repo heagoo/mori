@@ -38,6 +38,7 @@ enum KernelType {
   InterNode = 1,
   InterNodeV1 = 2,
   InterNodeV1LL = 3,
+  IntraNodeV1 = 4,
 };
 
 inline const char* HipDataTypeToString(hipDataType dtype) {

@@ -31,6 +31,7 @@
 #include "src/ops/dispatch_combine/internode.hpp"
 #include "src/ops/dispatch_combine/internode_v1.hpp"
 #include "src/ops/dispatch_combine/intranode.hpp"
+#include "src/ops/dispatch_combine/intranode_v1.hpp"
 
 namespace mori {
 namespace moe {
@@ -266,6 +267,12 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
       (config.worldSize * actualWarpNumPerBlock + config.numExpertPerRank * actualWarpNumPerBlock +
        config.numExpertPerRank) *
       sizeof(index_t);
+  
+  // IntraNodeV1 needs different shared memory size
+  if (kernelType == KernelType::IntraNodeV1) {
+    sharedMemSize = 2 * config.worldSize * actualWarpNumPerBlock * sizeof(index_t);
+  }
+  
   auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
   std::visit(
       [&](auto&& args) {
@@ -281,6 +288,8 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
           EpDispatchInterNodeV1KernelLowLatency<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           EpDispatchIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
+        } else if (kernelType == KernelType::IntraNodeV1) {
+          EpDispatchIntraNodeKernelV1<DataT><<<grid, block, sharedMemSize, stream>>>(args);
         } else {
           assert(false);
         }
@@ -309,7 +318,8 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
                    (kernelType == KernelType::InterNodeV1LL)) {
           assert(config.useExternalInpBuffer);
           EpCombineInterNodeV1Kernel<<<grid, block, sharedMemSize, stream>>>(args);
-        } else if (kernelType == KernelType::IntraNode) {
+        } else if ((kernelType == KernelType::IntraNode) ||
+                   (kernelType == KernelType::IntraNodeV1)) {
           EpCombineIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
         } else {
           assert(false);
