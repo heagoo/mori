@@ -130,6 +130,9 @@ class AllReduce {
   SymmMemObj* workspace_{nullptr};
   size_t workspaceSize_{0};
   
+  // Global step counter for synchronization (GPU memory)
+  int* d_stepCounter_{nullptr};
+  
   // Algorithm selection threshold
   static constexpr size_t SMALL_MSG_THRESHOLD = 32 * 1024;  // 32KB
   
