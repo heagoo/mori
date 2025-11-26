@@ -41,24 +41,72 @@ This document describes the implementation details, algorithms, and optimization
 └─────────────────────────────────────────┘
 ```
 
-### Kernel Architecture
+### Kernel Architecture - Single Launch Design
 
-The implementation uses a **unified kernel design** where a single GPU kernel handles all AllReduce operations. The kernel uses a state flag (`KernelState`) to control which operation to perform:
+The implementation uses a **single-launch kernel architecture** where each GPU kernel is launched only **once** per AllReduce operation and manages all algorithmic steps internally.
 
+**Key Design Principles:**
+1. **Single kernel launch** - Host calls `hipLaunchKernelGGL` only once
+2. **Internal state management** - Kernel loops through all steps internally
+3. **Atomic synchronization** - Uses global atomic counter for inter-GPU coordination
+4. **No host-side loops** - All iteration logic is inside the kernel
+
+**Kernel Implementation:**
 ```cpp
-enum class KernelState {
-  RING_REDUCE_SCATTER,   // Ring algorithm reduce-scatter phase
-  RING_ALLGATHER,        // Ring algorithm allgather phase
-  RECURSIVE_DOUBLING,    // Recursive doubling reduction
-  COPY_TO_OUTPUT         // Final copy to output buffer
-};
+__global__ void RingAllReduceKernel(
+    SymmMemObj* workspace,
+    const T* sendbuf,
+    T* recvbuf,
+    size_t count,
+    int rank,
+    int worldSize,
+    size_t chunkSize,
+    ReduceOp op,
+    int* globalStepCounter) {  // Atomic counter for sync
+  
+  // Phase 1: Reduce-Scatter (all steps in single launch)
+  for (int step = 1; step < worldSize; step++) {
+    // Atomic synchronization between GPUs
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+      atomicAdd(globalStepCounter, 1);
+      while (atomicAdd(globalStepCounter, 0) < (step * worldSize)) {
+        // Busy-wait for peer GPUs
+      }
+    }
+    __syncthreads();
+    
+    // Perform reduction for this step
+    // ...
+  }
+  
+  // Phase 2: AllGather (continues in same kernel)
+  for (int step = 1; step < worldSize; step++) {
+    // Similar atomic sync and gather logic
+    // ...
+  }
+}
 ```
 
-**Benefits of unified kernel design:**
-- Reduced kernel launch overhead
-- Better code reuse and maintainability
-- Cleaner API surface
-- Single kernel to optimize and debug
+**Host Code (simplified):**
+```cpp
+// Reset atomic counter
+hipMemsetAsync(d_stepCounter_, 0, sizeof(int), stream);
+
+// Launch kernel ONCE for entire AllReduce operation
+hipLaunchKernelGGL(RingAllReduceKernel<float>, gridSize, blockSize, 0, stream,
+                   workspace_, sendbuf, recvbuf, count,
+                   rank, worldSize, chunkSize, op, d_stepCounter_);
+
+// Wait for completion
+hipStreamSynchronize(stream);
+```
+
+**Benefits of single-launch design:**
+- ✅ **Minimal launch overhead** - One launch vs 2*(worldSize-1) launches
+- ✅ **Better GPU occupancy** - Kernel stays resident on GPU
+- ✅ **Simplified host code** - No loops or complex orchestration
+- ✅ **Atomic-based coordination** - Efficient inter-GPU synchronization
+- ✅ **Lower latency** - Eliminates CPU-GPU round trips between steps
 
 ## Symmetric Memory Management
 
@@ -211,49 +259,69 @@ This threshold is tunable based on hardware characteristics.
 
 ## Optimizations
 
-### 1. Unified Kernel Design
+### 1. Single-Launch Kernel Architecture
 
-**Benefit**: Reduced kernel launch overhead and improved code maintainability
+**Benefit**: Drastically reduced kernel launch overhead and improved GPU utilization
 
-**Implementation**:
+**Previous approach**: Multiple kernel launches in host-side loop
 ```cpp
-// Single kernel handles all operations via state parameter
-template <typename T>
-__global__ void UnifiedAllReduceKernel(
-    KernelState state,        // Controls which operation to perform
-    SymmMemObj* workspace,
-    const T* sendbuf,
-    T* recvbuf,
-    size_t count,
-    int rank,
-    int worldSize,
-    int step,
-    size_t chunkSize,
-    int partnerRank,
-    ReduceOp op) {
-  
-  switch (state) {
-    case KernelState::RING_REDUCE_SCATTER:
-      // Perform reduce-scatter logic
-      break;
-    case KernelState::RING_ALLGATHER:
-      // Perform allgather logic
-      break;
-    case KernelState::RECURSIVE_DOUBLING:
-      // Perform recursive doubling logic
-      break;
-    case KernelState::COPY_TO_OUTPUT:
-      // Copy final results
-      break;
+// OLD: Multiple launches
+for (int step = 1; step < worldSize; step++) {
+  hipLaunchKernelGGL(kernel, ...);  // Launch overhead per step
+  hipStreamSynchronize(stream);      // CPU-GPU sync overhead
+}
+```
+
+**Current approach**: Single kernel launch with internal iteration
+```cpp
+// NEW: Single launch
+hipLaunchKernelGGL(RingAllReduceKernel, ..., d_stepCounter_);
+
+// Inside kernel:
+__global__ void RingAllReduceKernel(..., int* globalStepCounter) {
+  for (int step = 1; step < worldSize; step++) {
+    // Atomic synchronization
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+      atomicAdd(globalStepCounter, 1);
+      while (atomicAdd(globalStepCounter, 0) < (step * worldSize)) {
+        // Busy-wait for peers
+      }
+    }
+    __syncthreads();
+    // Perform operation
   }
 }
 ```
 
-**Previous design**: Used 4 separate kernels (RingReduceScatterKernel, RingAllgatherKernel, RecursiveDoublingReduceKernel, CopyToOutputKernel)
+**Performance impact**:
+- Eliminates 2*(worldSize-1) kernel launches (e.g., 14 launches for 8 GPUs)
+- Removes CPU-GPU synchronization between steps
+- Keeps kernel resident on GPU throughout operation
+- Estimated ~10-50μs savings per avoided launch
 
-**Current design**: Single unified kernel with state parameter for operation control
+### 2. Atomic-Based Inter-GPU Synchronization
 
-### 2. Direct P2P Memory Access
+**Benefit**: Efficient coordination between GPUs without host intervention
+
+**Implementation**:
+```cpp
+// Global atomic counter in GPU memory
+int* d_stepCounter_;
+
+// In kernel:
+if (threadIdx.x == 0 && blockIdx.x == 0) {
+  atomicAdd(globalStepCounter, 1);  // Signal completion
+  // Wait for all peers to reach this step
+  while (atomicAdd(globalStepCounter, 0) < (step * worldSize)) {
+    // Busy-wait (more efficient than host sync)
+  }
+}
+__syncthreads();  // Sync threads in block
+```
+
+This replaces expensive CPU-GPU synchronization with lightweight GPU atomics.
+
+### 3. Direct P2P Memory Access
 
 **Benefit**: Zero-copy data transfer without CPU/host involvement
 
@@ -267,7 +335,7 @@ __global__ void kernel(SymmMemObj* workspace, int peer_rank) {
 }
 ```
 
-### 3. Vectorized Memory Operations
+### 4. Vectorized Memory Operations
 
 **Benefit**: Increased memory bandwidth utilization
 
@@ -280,7 +348,7 @@ reinterpret_cast<float4*>(dst)[i] = vec;
 
 This can provide up to 4× improvement for float data.
 
-### 4. Memory Coalescing
+### 5. Memory Coalescing
 
 **Benefit**: Efficient use of memory bandwidth
 
@@ -300,7 +368,7 @@ Pipeline Stage 3: Transfer chunk 2, Compute chunk 1
 ...
 ```
 
-### 6. Workspace Reuse
+### 7. Workspace Reuse
 
 **Benefit**: Reduced memory allocation overhead
 
