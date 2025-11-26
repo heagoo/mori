@@ -107,19 +107,22 @@ void AllReduce::RingAllReduce(const void* sendbuf, void* recvbuf, size_t count,
   for (int step = 1; step < worldSize; step++) {
     switch (datatype) {
       case HIP_R_32F:
-        hipLaunchKernelGGL(RingReduceScatterKernel<float>, gridSize, blockSize, 0, stream,
-                          workspace_, static_cast<const float*>(sendbuf), count,
-                          rank, worldSize, step, chunkSize, op);
+        hipLaunchKernelGGL(UnifiedAllReduceKernel<float>, gridSize, blockSize, 0, stream,
+                          KernelState::RING_REDUCE_SCATTER,
+                          workspace_, static_cast<const float*>(sendbuf), nullptr, count,
+                          rank, worldSize, step, chunkSize, 0, op);
         break;
       case HIP_R_64F:
-        hipLaunchKernelGGL(RingReduceScatterKernel<double>, gridSize, blockSize, 0, stream,
-                          workspace_, static_cast<const double*>(sendbuf), count,
-                          rank, worldSize, step, chunkSize, op);
+        hipLaunchKernelGGL(UnifiedAllReduceKernel<double>, gridSize, blockSize, 0, stream,
+                          KernelState::RING_REDUCE_SCATTER,
+                          workspace_, static_cast<const double*>(sendbuf), nullptr, count,
+                          rank, worldSize, step, chunkSize, 0, op);
         break;
       case HIP_R_32I:
-        hipLaunchKernelGGL(RingReduceScatterKernel<int32_t>, gridSize, blockSize, 0, stream,
-                          workspace_, static_cast<const int32_t*>(sendbuf), count,
-                          rank, worldSize, step, chunkSize, op);
+        hipLaunchKernelGGL(UnifiedAllReduceKernel<int32_t>, gridSize, blockSize, 0, stream,
+                          KernelState::RING_REDUCE_SCATTER,
+                          workspace_, static_cast<const int32_t*>(sendbuf), nullptr, count,
+                          rank, worldSize, step, chunkSize, 0, op);
         break;
       default:
         fprintf(stderr, "Unsupported data type in RingAllReduce\n");
@@ -134,19 +137,22 @@ void AllReduce::RingAllReduce(const void* sendbuf, void* recvbuf, size_t count,
   for (int step = 1; step < worldSize; step++) {
     switch (datatype) {
       case HIP_R_32F:
-        hipLaunchKernelGGL(RingAllgatherKernel<float>, gridSize, blockSize, 0, stream,
-                          workspace_, static_cast<float*>(recvbuf), count,
-                          rank, worldSize, step, chunkSize);
+        hipLaunchKernelGGL(UnifiedAllReduceKernel<float>, gridSize, blockSize, 0, stream,
+                          KernelState::RING_ALLGATHER,
+                          workspace_, nullptr, static_cast<float*>(recvbuf), count,
+                          rank, worldSize, step, chunkSize, 0, op);
         break;
       case HIP_R_64F:
-        hipLaunchKernelGGL(RingAllgatherKernel<double>, gridSize, blockSize, 0, stream,
-                          workspace_, static_cast<double*>(recvbuf), count,
-                          rank, worldSize, step, chunkSize);
+        hipLaunchKernelGGL(UnifiedAllReduceKernel<double>, gridSize, blockSize, 0, stream,
+                          KernelState::RING_ALLGATHER,
+                          workspace_, nullptr, static_cast<double*>(recvbuf), count,
+                          rank, worldSize, step, chunkSize, 0, op);
         break;
       case HIP_R_32I:
-        hipLaunchKernelGGL(RingAllgatherKernel<int32_t>, gridSize, blockSize, 0, stream,
-                          workspace_, static_cast<int32_t*>(recvbuf), count,
-                          rank, worldSize, step, chunkSize);
+        hipLaunchKernelGGL(UnifiedAllReduceKernel<int32_t>, gridSize, blockSize, 0, stream,
+                          KernelState::RING_ALLGATHER,
+                          workspace_, nullptr, static_cast<int32_t*>(recvbuf), count,
+                          rank, worldSize, step, chunkSize, 0, op);
         break;
       default:
         fprintf(stderr, "Unsupported data type in RingAllReduce\n");
@@ -165,22 +171,28 @@ void AllReduce::RingAllReduce(const void* sendbuf, void* recvbuf, size_t count,
   gridSize = (chunkCount + blockSize - 1) / blockSize;
   switch (datatype) {
     case HIP_R_32F:
-      hipLaunchKernelGGL(CopyToOutputKernel<float>, gridSize, blockSize, 0, stream,
+      hipLaunchKernelGGL(UnifiedAllReduceKernel<float>, gridSize, blockSize, 0, stream,
+                        KernelState::COPY_TO_OUTPUT,
+                        nullptr,
                         workspace_->GetAs<float>() + chunkStart,
                         static_cast<float*>(recvbuf) + chunkStart,
-                        chunkCount, op, worldSize);
+                        chunkCount, rank, worldSize, 0, 0, 0, op);
       break;
     case HIP_R_64F:
-      hipLaunchKernelGGL(CopyToOutputKernel<double>, gridSize, blockSize, 0, stream,
+      hipLaunchKernelGGL(UnifiedAllReduceKernel<double>, gridSize, blockSize, 0, stream,
+                        KernelState::COPY_TO_OUTPUT,
+                        nullptr,
                         workspace_->GetAs<double>() + chunkStart,
                         static_cast<double*>(recvbuf) + chunkStart,
-                        chunkCount, op, worldSize);
+                        chunkCount, rank, worldSize, 0, 0, 0, op);
       break;
     case HIP_R_32I:
-      hipLaunchKernelGGL(CopyToOutputKernel<int32_t>, gridSize, blockSize, 0, stream,
+      hipLaunchKernelGGL(UnifiedAllReduceKernel<int32_t>, gridSize, blockSize, 0, stream,
+                        KernelState::COPY_TO_OUTPUT,
+                        nullptr,
                         workspace_->GetAs<int32_t>() + chunkStart,
                         static_cast<int32_t*>(recvbuf) + chunkStart,
-                        chunkCount, op, worldSize);
+                        chunkCount, rank, worldSize, 0, 0, 0, op);
       break;
     default:
       break;
@@ -215,22 +227,25 @@ void AllReduce::RecursiveDoublingAllReduce(const void* sendbuf, void* recvbuf,
     
     switch (datatype) {
       case HIP_R_32F:
-        hipLaunchKernelGGL(RecursiveDoublingReduceKernel<float>, gridSize, blockSize, 0, stream,
+        hipLaunchKernelGGL(UnifiedAllReduceKernel<float>, gridSize, blockSize, 0, stream,
+                          KernelState::RECURSIVE_DOUBLING,
                           workspace_, static_cast<const float*>(sendbuf),
                           static_cast<float*>(recvbuf), count,
-                          rank, worldSize, step, partnerRank, op);
+                          rank, worldSize, step, 0, partnerRank, op);
         break;
       case HIP_R_64F:
-        hipLaunchKernelGGL(RecursiveDoublingReduceKernel<double>, gridSize, blockSize, 0, stream,
+        hipLaunchKernelGGL(UnifiedAllReduceKernel<double>, gridSize, blockSize, 0, stream,
+                          KernelState::RECURSIVE_DOUBLING,
                           workspace_, static_cast<const double*>(sendbuf),
                           static_cast<double*>(recvbuf), count,
-                          rank, worldSize, step, partnerRank, op);
+                          rank, worldSize, step, 0, partnerRank, op);
         break;
       case HIP_R_32I:
-        hipLaunchKernelGGL(RecursiveDoublingReduceKernel<int32_t>, gridSize, blockSize, 0, stream,
+        hipLaunchKernelGGL(UnifiedAllReduceKernel<int32_t>, gridSize, blockSize, 0, stream,
+                          KernelState::RECURSIVE_DOUBLING,
                           workspace_, static_cast<const int32_t*>(sendbuf),
                           static_cast<int32_t*>(recvbuf), count,
-                          rank, worldSize, step, partnerRank, op);
+                          rank, worldSize, step, 0, partnerRank, op);
         break;
       default:
         fprintf(stderr, "Unsupported data type in RecursiveDoublingAllReduce\n");
@@ -243,22 +258,28 @@ void AllReduce::RecursiveDoublingAllReduce(const void* sendbuf, void* recvbuf,
   // Copy final result to recvbuf
   switch (datatype) {
     case HIP_R_32F:
-      hipLaunchKernelGGL(CopyToOutputKernel<float>, gridSize, blockSize, 0, stream,
+      hipLaunchKernelGGL(UnifiedAllReduceKernel<float>, gridSize, blockSize, 0, stream,
+                        KernelState::COPY_TO_OUTPUT,
+                        nullptr,
                         workspace_->GetAs<float>(),
                         static_cast<float*>(recvbuf),
-                        count, op, worldSize);
+                        count, rank, worldSize, 0, 0, 0, op);
       break;
     case HIP_R_64F:
-      hipLaunchKernelGGL(CopyToOutputKernel<double>, gridSize, blockSize, 0, stream,
+      hipLaunchKernelGGL(UnifiedAllReduceKernel<double>, gridSize, blockSize, 0, stream,
+                        KernelState::COPY_TO_OUTPUT,
+                        nullptr,
                         workspace_->GetAs<double>(),
                         static_cast<double*>(recvbuf),
-                        count, op, worldSize);
+                        count, rank, worldSize, 0, 0, 0, op);
       break;
     case HIP_R_32I:
-      hipLaunchKernelGGL(CopyToOutputKernel<int32_t>, gridSize, blockSize, 0, stream,
+      hipLaunchKernelGGL(UnifiedAllReduceKernel<int32_t>, gridSize, blockSize, 0, stream,
+                        KernelState::COPY_TO_OUTPUT,
+                        nullptr,
                         workspace_->GetAs<int32_t>(),
                         static_cast<int32_t*>(recvbuf),
-                        count, op, worldSize);
+                        count, rank, worldSize, 0, 0, 0, op);
       break;
     default:
       break;
