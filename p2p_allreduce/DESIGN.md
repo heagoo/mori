@@ -21,6 +21,14 @@ This document describes the implementation details, algorithms, and optimization
 └─────────────────────────────────────────┘
               ↓
 ┌─────────────────────────────────────────┐
+│      Unified GPU Kernel                 │
+│  - State-based operation control        │
+│  - Ring reduce-scatter/allgather        │
+│  - Recursive doubling                   │
+│  - Output copy                          │
+└─────────────────────────────────────────┘
+              ↓
+┌─────────────────────────────────────────┐
 │    Symmetric Memory Manager             │
 │  - Memory Registration                  │
 │  - P2P Handle Management                │
@@ -32,6 +40,25 @@ This document describes the implementation details, algorithms, and optimization
 │  - Collective Operations                │
 └─────────────────────────────────────────┘
 ```
+
+### Kernel Architecture
+
+The implementation uses a **unified kernel design** where a single GPU kernel handles all AllReduce operations. The kernel uses a state flag (`KernelState`) to control which operation to perform:
+
+```cpp
+enum class KernelState {
+  RING_REDUCE_SCATTER,   // Ring algorithm reduce-scatter phase
+  RING_ALLGATHER,        // Ring algorithm allgather phase
+  RECURSIVE_DOUBLING,    // Recursive doubling reduction
+  COPY_TO_OUTPUT         // Final copy to output buffer
+};
+```
+
+**Benefits of unified kernel design:**
+- Reduced kernel launch overhead
+- Better code reuse and maintainability
+- Cleaner API surface
+- Single kernel to optimize and debug
 
 ## Symmetric Memory Management
 
@@ -184,7 +211,49 @@ This threshold is tunable based on hardware characteristics.
 
 ## Optimizations
 
-### 1. Direct P2P Memory Access
+### 1. Unified Kernel Design
+
+**Benefit**: Reduced kernel launch overhead and improved code maintainability
+
+**Implementation**:
+```cpp
+// Single kernel handles all operations via state parameter
+template <typename T>
+__global__ void UnifiedAllReduceKernel(
+    KernelState state,        // Controls which operation to perform
+    SymmMemObj* workspace,
+    const T* sendbuf,
+    T* recvbuf,
+    size_t count,
+    int rank,
+    int worldSize,
+    int step,
+    size_t chunkSize,
+    int partnerRank,
+    ReduceOp op) {
+  
+  switch (state) {
+    case KernelState::RING_REDUCE_SCATTER:
+      // Perform reduce-scatter logic
+      break;
+    case KernelState::RING_ALLGATHER:
+      // Perform allgather logic
+      break;
+    case KernelState::RECURSIVE_DOUBLING:
+      // Perform recursive doubling logic
+      break;
+    case KernelState::COPY_TO_OUTPUT:
+      // Copy final results
+      break;
+  }
+}
+```
+
+**Previous design**: Used 4 separate kernels (RingReduceScatterKernel, RingAllgatherKernel, RecursiveDoublingReduceKernel, CopyToOutputKernel)
+
+**Current design**: Single unified kernel with state parameter for operation control
+
+### 2. Direct P2P Memory Access
 
 **Benefit**: Zero-copy data transfer without CPU/host involvement
 
@@ -198,7 +267,7 @@ __global__ void kernel(SymmMemObj* workspace, int peer_rank) {
 }
 ```
 
-### 2. Vectorized Memory Operations
+### 3. Vectorized Memory Operations
 
 **Benefit**: Increased memory bandwidth utilization
 
@@ -211,7 +280,7 @@ reinterpret_cast<float4*>(dst)[i] = vec;
 
 This can provide up to 4× improvement for float data.
 
-### 3. Memory Coalescing
+### 4. Memory Coalescing
 
 **Benefit**: Efficient use of memory bandwidth
 
@@ -220,7 +289,7 @@ This can provide up to 4× improvement for float data.
 - Enables coalesced memory transactions
 - Reduces memory latency
 
-### 4. Overlapping Computation and Communication
+### 5. Overlapping Computation and Communication
 
 For future optimization, computation can overlap with data transfer:
 
@@ -231,7 +300,7 @@ Pipeline Stage 3: Transfer chunk 2, Compute chunk 1
 ...
 ```
 
-### 5. Workspace Reuse
+### 6. Workspace Reuse
 
 **Benefit**: Reduced memory allocation overhead
 
