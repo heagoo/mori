@@ -27,12 +27,19 @@
 
 namespace p2p_allreduce {
 
+// Device-side helper to get pointer from peer array
+template <typename T>
+__device__ inline T* GetPeerPtr(uintptr_t* d_peerPtrs, int pe) {
+  return reinterpret_cast<T*>(d_peerPtrs[pe]);
+}
+
 // Single-launch Ring AllReduce kernel
 // Manages all steps internally using P2P step counters for peer-to-peer synchronization
 // Each rank only waits for the rank it depends on by checking that rank's counter
+// Uses d_peerPtrs arrays for device-accessible peer pointers
 template <typename T>
 __global__ void RingAllReduceKernel(
-    SymmMemObj* workspace,
+    uintptr_t* workspacePeerPtrs,    // Device array of workspace peer pointers
     const T* sendbuf,
     T* recvbuf,
     size_t count,
@@ -40,12 +47,15 @@ __global__ void RingAllReduceKernel(
     int worldSize,
     size_t chunkSize,
     ReduceOp op,
-    SymmMemObj* stepCounters) {
-  
+    uintptr_t* stepCounterPeerPtrs)  // Device array of step counter peer pointers
+{
   size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
   
   // Get local and peer step counter pointers
-  volatile int* myCounter = stepCounters->GetAs<int>();
+  volatile int* myCounter = GetPeerPtr<int>(stepCounterPeerPtrs, rank);
+  
+  // Get local workspace pointer
+  T* localWorkspace = GetPeerPtr<T>(workspacePeerPtrs, rank);
   
   // Phase 1: Reduce-Scatter
   // Process all steps in a single kernel launch
@@ -60,10 +70,10 @@ __global__ void RingAllReduceKernel(
     
     // Get pointer to peer's data (the rank we read from)
     int peerRank = (rank - 1 + worldSize) % worldSize;
-    const T* peerData = workspace->GetPeerAs<T>(peerRank) + chunkStart;
+    const T* peerData = GetPeerPtr<T>(workspacePeerPtrs, peerRank) + chunkStart;
     
     // Local workspace
-    T* localData = workspace->GetAs<T>() + chunkStart;
+    T* localData = localWorkspace + chunkStart;
     
     // If this is the first step, copy from sendbuf
     if (step == 1 && idx < chunkCount) {
@@ -79,7 +89,7 @@ __global__ void RingAllReduceKernel(
       __threadfence_system();
       
       // Wait only for the peer we depend on (the one we read from)
-      volatile int* peerCounter = stepCounters->GetPeerAs<int>(peerRank);
+      volatile int* peerCounter = GetPeerPtr<int>(stepCounterPeerPtrs, peerRank);
       while (*peerCounter < step) {
         // Busy wait for peer to complete this step
       }
@@ -121,7 +131,7 @@ __global__ void RingAllReduceKernel(
     
     // Get pointer to peer's data
     int peerRank = (rank - 1 + worldSize) % worldSize;
-    const T* peerData = workspace->GetPeerAs<T>(peerRank) + chunkStart;
+    const T* peerData = GetPeerPtr<T>(workspacePeerPtrs, peerRank) + chunkStart;
     
     // Memory fence and signal completion, then wait for peer
     if (threadIdx.x == 0 && blockIdx.x == 0) {
@@ -131,7 +141,7 @@ __global__ void RingAllReduceKernel(
       __threadfence_system();
       
       // Wait only for the peer we depend on
-      volatile int* peerCounter = stepCounters->GetPeerAs<int>(peerRank);
+      volatile int* peerCounter = GetPeerPtr<int>(stepCounterPeerPtrs, peerRank);
       int expectedPeerStep = (worldSize - 1) + step;
       while (*peerCounter < expectedPeerStep) {
         // Busy wait for peer
@@ -153,7 +163,7 @@ __global__ void RingAllReduceKernel(
   size_t chunkCount = chunkEnd - chunkStart;
   
   if (idx < chunkCount) {
-    T val = workspace->GetAs<T>()[chunkStart + idx];
+    T val = localWorkspace[chunkStart + idx];
     if (op == ReduceOp::AVG) {
       val /= static_cast<T>(worldSize);
     }
@@ -163,21 +173,25 @@ __global__ void RingAllReduceKernel(
 
 // Single-launch Recursive Doubling AllReduce kernel
 // Each rank only waits for its partner rank by checking that rank's counter
+// Uses d_peerPtrs arrays for device-accessible peer pointers
 template <typename T>
 __global__ void RecursiveDoublingAllReduceKernel(
-    SymmMemObj* workspace,
+    uintptr_t* workspacePeerPtrs,    // Device array of workspace peer pointers
     const T* sendbuf,
     T* recvbuf,
     size_t count,
     int rank,
     int worldSize,
     ReduceOp op,
-    SymmMemObj* stepCounters) {
-  
+    uintptr_t* stepCounterPeerPtrs)  // Device array of step counter peer pointers
+{
   size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
   
   // Get local step counter pointer
-  volatile int* myCounter = stepCounters->GetAs<int>();
+  volatile int* myCounter = GetPeerPtr<int>(stepCounterPeerPtrs, rank);
+  
+  // Get local workspace pointer
+  T* localWorkspace = GetPeerPtr<T>(workspacePeerPtrs, rank);
   
   // Number of steps in recursive doubling
   int numSteps = 0;
@@ -189,7 +203,7 @@ __global__ void RecursiveDoublingAllReduceKernel(
   
   // Initialize workspace with sendbuf
   if (idx < count) {
-    workspace->GetAs<T>()[idx] = sendbuf[idx];
+    localWorkspace[idx] = sendbuf[idx];
   }
   __syncthreads();
   
@@ -217,7 +231,7 @@ __global__ void RecursiveDoublingAllReduceKernel(
       __threadfence_system();
       
       // Wait only for our partner rank
-      volatile int* partnerCounter = stepCounters->GetPeerAs<int>(partnerRank);
+      volatile int* partnerCounter = GetPeerPtr<int>(stepCounterPeerPtrs, partnerRank);
       while (*partnerCounter < (step + 1)) {
         // Busy wait for partner
       }
@@ -226,25 +240,24 @@ __global__ void RecursiveDoublingAllReduceKernel(
     
     if (idx < count) {
       // Get pointer to partner's data
-      const T* partnerData = workspace->GetPeerAs<T>(partnerRank);
-      T* localData = workspace->GetAs<T>();
+      const T* partnerData = GetPeerPtr<T>(workspacePeerPtrs, partnerRank);
       
       T val = partnerData[idx];
       switch (op) {
         case ReduceOp::SUM:
-          localData[idx] += val;
+          localWorkspace[idx] += val;
           break;
         case ReduceOp::PROD:
-          localData[idx] *= val;
+          localWorkspace[idx] *= val;
           break;
         case ReduceOp::MIN:
-          localData[idx] = (localData[idx] < val) ? localData[idx] : val;
+          localWorkspace[idx] = (localWorkspace[idx] < val) ? localWorkspace[idx] : val;
           break;
         case ReduceOp::MAX:
-          localData[idx] = (localData[idx] > val) ? localData[idx] : val;
+          localWorkspace[idx] = (localWorkspace[idx] > val) ? localWorkspace[idx] : val;
           break;
         case ReduceOp::AVG:
-          localData[idx] += val;
+          localWorkspace[idx] += val;
           break;
       }
     }
@@ -253,7 +266,7 @@ __global__ void RecursiveDoublingAllReduceKernel(
   
   // Copy final result to recvbuf
   if (idx < count) {
-    T val = workspace->GetAs<T>()[idx];
+    T val = localWorkspace[idx];
     if (op == ReduceOp::AVG) {
       val /= static_cast<T>(worldSize);
     }

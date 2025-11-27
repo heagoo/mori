@@ -32,27 +32,40 @@ namespace p2p_allreduce {
 // Symmetric memory object structure
 // Manages memory that is accessible across all processes via P2P
 struct SymmMemObj {
-  void* localPtr{nullptr};           // Local memory pointer
-  uintptr_t* peerPtrs{nullptr};      // Array of peer memory pointers (one per rank)
-  hipIpcMemHandle_t* ipcHandles{nullptr};  // IPC handles for peer access
-  size_t size{0};                    // Size of the memory region
+  void* localPtr{nullptr};                    // Local memory pointer
+  uintptr_t* peerPtrs{nullptr};               // Array of peer memory pointers (HOST memory, for registration)
+  uintptr_t* d_peerPtrs{nullptr};             // Array of peer memory pointers (DEVICE memory, for kernel access)
+  hipIpcMemHandle_t* ipcHandles{nullptr};     // IPC handles for peer access
+  size_t size{0};                             // Size of the memory region
+  int worldSize{0};                           // Number of ranks for proper indexing
 
-  // Get local pointer
-  inline __device__ __host__ void* Get() const { return localPtr; }
+  // Get local pointer (host-side)
+  inline __host__ void* Get() const { return localPtr; }
   
-  // Get pointer to peer memory
-  inline __device__ __host__ void* GetPeer(int pe) const {
+  // Get pointer to peer memory (host-side)
+  inline __host__ void* GetPeer(int pe) const {
     return reinterpret_cast<void*>(peerPtrs[pe]);
   }
   
   template <typename T>
-  inline __device__ __host__ T* GetAs() const {
+  inline __host__ T* GetAs() const {
     return reinterpret_cast<T*>(localPtr);
   }
   
   template <typename T>
-  inline __device__ __host__ T* GetPeerAs(int pe) const {
+  inline __host__ T* GetPeerAs(int pe) const {
     return reinterpret_cast<T*>(peerPtrs[pe]);
+  }
+  
+  // Device-side accessors using d_peerPtrs
+  template <typename T>
+  inline __device__ T* GetLocalDevice() const {
+    return reinterpret_cast<T*>(d_peerPtrs[0]);  // First entry is local ptr
+  }
+  
+  template <typename T>
+  inline __device__ T* GetPeerDevice(int pe) const {
+    return reinterpret_cast<T*>(d_peerPtrs[pe]);
   }
 };
 

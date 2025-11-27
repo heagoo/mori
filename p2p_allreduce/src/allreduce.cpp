@@ -117,25 +117,29 @@ void AllReduce::RingAllReduce(const void* sendbuf, void* recvbuf, size_t count,
   // Synchronize all ranks before starting (barrier)
   bootstrap_.Barrier();
   
+  // Get device-side peer pointer arrays
+  uintptr_t* workspacePeerPtrs = workspace_->d_peerPtrs;
+  uintptr_t* stepCounterPeerPtrs = stepCounters_->d_peerPtrs;
+  
   // Launch kernel ONCE for entire AllReduce operation
   switch (datatype) {
     case HIP_R_32F:
       hipLaunchKernelGGL(RingAllReduceKernel<float>, gridSize, blockSize, 0, stream,
-                        workspace_, static_cast<const float*>(sendbuf),
+                        workspacePeerPtrs, static_cast<const float*>(sendbuf),
                         static_cast<float*>(recvbuf), count,
-                        rank, worldSize, chunkSize, op, stepCounters_);
+                        rank, worldSize, chunkSize, op, stepCounterPeerPtrs);
       break;
     case HIP_R_64F:
       hipLaunchKernelGGL(RingAllReduceKernel<double>, gridSize, blockSize, 0, stream,
-                        workspace_, static_cast<const double*>(sendbuf),
+                        workspacePeerPtrs, static_cast<const double*>(sendbuf),
                         static_cast<double*>(recvbuf), count,
-                        rank, worldSize, chunkSize, op, stepCounters_);
+                        rank, worldSize, chunkSize, op, stepCounterPeerPtrs);
       break;
     case HIP_R_32I:
       hipLaunchKernelGGL(RingAllReduceKernel<int32_t>, gridSize, blockSize, 0, stream,
-                        workspace_, static_cast<const int32_t*>(sendbuf),
+                        workspacePeerPtrs, static_cast<const int32_t*>(sendbuf),
                         static_cast<int32_t*>(recvbuf), count,
-                        rank, worldSize, chunkSize, op, stepCounters_);
+                        rank, worldSize, chunkSize, op, stepCounterPeerPtrs);
       break;
     default:
       fprintf(stderr, "Unsupported data type in RingAllReduce\n");
@@ -166,25 +170,29 @@ void AllReduce::RecursiveDoublingAllReduce(const void* sendbuf, void* recvbuf,
   // Synchronize all ranks before starting (barrier)
   bootstrap_.Barrier();
   
+  // Get device-side peer pointer arrays
+  uintptr_t* workspacePeerPtrs = workspace_->d_peerPtrs;
+  uintptr_t* stepCounterPeerPtrs = stepCounters_->d_peerPtrs;
+  
   // Launch kernel ONCE for entire AllReduce operation
   switch (datatype) {
     case HIP_R_32F:
       hipLaunchKernelGGL(RecursiveDoublingAllReduceKernel<float>, gridSize, blockSize, 0, stream,
-                        workspace_, static_cast<const float*>(sendbuf),
+                        workspacePeerPtrs, static_cast<const float*>(sendbuf),
                         static_cast<float*>(recvbuf), count,
-                        rank, worldSize, op, stepCounters_);
+                        rank, worldSize, op, stepCounterPeerPtrs);
       break;
     case HIP_R_64F:
       hipLaunchKernelGGL(RecursiveDoublingAllReduceKernel<double>, gridSize, blockSize, 0, stream,
-                        workspace_, static_cast<const double*>(sendbuf),
+                        workspacePeerPtrs, static_cast<const double*>(sendbuf),
                         static_cast<double*>(recvbuf), count,
-                        rank, worldSize, op, stepCounters_);
+                        rank, worldSize, op, stepCounterPeerPtrs);
       break;
     case HIP_R_32I:
       hipLaunchKernelGGL(RecursiveDoublingAllReduceKernel<int32_t>, gridSize, blockSize, 0, stream,
-                        workspace_, static_cast<const int32_t*>(sendbuf),
+                        workspacePeerPtrs, static_cast<const int32_t*>(sendbuf),
                         static_cast<int32_t*>(recvbuf), count,
-                        rank, worldSize, op, stepCounters_);
+                        rank, worldSize, op, stepCounterPeerPtrs);
       break;
     default:
       fprintf(stderr, "Unsupported data type in RecursiveDoublingAllReduce\n");

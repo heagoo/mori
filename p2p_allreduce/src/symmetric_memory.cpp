@@ -87,8 +87,9 @@ SymmMemObj* SymmMemManager::Register(void* ptr, size_t size) {
   SymmMemObj* obj = new SymmMemObj();
   obj->localPtr = ptr;
   obj->size = size;
+  obj->worldSize = worldSize;
   
-  // Allocate arrays for peer information
+  // Allocate arrays for peer information (host memory)
   obj->peerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
   obj->ipcHandles = static_cast<hipIpcMemHandle_t*>(
       calloc(worldSize, sizeof(hipIpcMemHandle_t)));
@@ -114,6 +115,11 @@ SymmMemObj* SymmMemManager::Register(void* ptr, size_t size) {
     }
   }
   
+  // Allocate device-side peer pointer array and copy data
+  HIP_CHECK(hipMalloc(&obj->d_peerPtrs, worldSize * sizeof(uintptr_t)));
+  HIP_CHECK(hipMemcpy(obj->d_peerPtrs, obj->peerPtrs, 
+                      worldSize * sizeof(uintptr_t), hipMemcpyHostToDevice));
+  
   return obj;
 }
 
@@ -122,6 +128,12 @@ void SymmMemManager::Deregister(SymmMemObj* obj) {
   
   int worldSize = bootstrap_.GetWorldSize();
   int rank = bootstrap_.GetRank();
+  
+  // Free device-side peer pointer array
+  if (obj->d_peerPtrs) {
+    HIP_CHECK(hipFree(obj->d_peerPtrs));
+    obj->d_peerPtrs = nullptr;
+  }
   
   // Close IPC handles for all peers
   if (obj->peerPtrs) {
