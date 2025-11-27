@@ -28,7 +28,8 @@
 namespace p2p_allreduce {
 
 // Single-launch Ring AllReduce kernel
-// Manages all steps internally using cooperative groups and atomics
+// Manages all steps internally using P2P step counters for peer-to-peer synchronization
+// Each rank only waits for the rank it depends on by checking that rank's counter
 template <typename T>
 __global__ void RingAllReduceKernel(
     SymmMemObj* workspace,
@@ -39,9 +40,12 @@ __global__ void RingAllReduceKernel(
     int worldSize,
     size_t chunkSize,
     ReduceOp op,
-    int* globalStepCounter) {
+    SymmMemObj* stepCounters) {
   
   size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  
+  // Get local and peer step counter pointers
+  volatile int* myCounter = stepCounters->GetAs<int>();
   
   // Phase 1: Reduce-Scatter
   // Process all steps in a single kernel launch
@@ -54,7 +58,7 @@ __global__ void RingAllReduceKernel(
     size_t chunkEnd = min(chunkStart + chunkSize, count);
     size_t chunkCount = chunkEnd - chunkStart;
     
-    // Get pointer to peer's data
+    // Get pointer to peer's data (the rank we read from)
     int peerRank = (rank - 1 + worldSize) % worldSize;
     const T* peerData = workspace->GetPeerAs<T>(peerRank) + chunkStart;
     
@@ -65,14 +69,19 @@ __global__ void RingAllReduceKernel(
     if (step == 1 && idx < chunkCount) {
       localData[idx] = sendbuf[chunkStart + idx];
     }
+    __syncthreads();
     
-    // Synchronize with peer GPU using atomic counter
+    // Memory fence to ensure data is visible to other GPUs
     if (threadIdx.x == 0 && blockIdx.x == 0) {
-      // Signal that we're ready
-      atomicAdd(globalStepCounter, 1);
-      // Wait for peer to be ready (busy wait)
-      while (atomicAdd(globalStepCounter, 0) < (step * worldSize)) {
-        // Busy wait
+      __threadfence_system();
+      // Signal that we've completed this step by updating our counter
+      atomicAdd((int*)myCounter, 1);
+      __threadfence_system();
+      
+      // Wait only for the peer we depend on (the one we read from)
+      volatile int* peerCounter = stepCounters->GetPeerAs<int>(peerRank);
+      while (*peerCounter < step) {
+        // Busy wait for peer to complete this step
       }
     }
     __syncthreads();
@@ -114,11 +123,18 @@ __global__ void RingAllReduceKernel(
     int peerRank = (rank - 1 + worldSize) % worldSize;
     const T* peerData = workspace->GetPeerAs<T>(peerRank) + chunkStart;
     
-    // Synchronize with peer GPU
+    // Memory fence and signal completion, then wait for peer
     if (threadIdx.x == 0 && blockIdx.x == 0) {
-      atomicAdd(globalStepCounter, 1);
-      while (atomicAdd(globalStepCounter, 0) < ((worldSize - 1 + step) * worldSize)) {
-        // Busy wait
+      __threadfence_system();
+      // Signal that we've completed this allgather step
+      atomicAdd((int*)myCounter, 1);
+      __threadfence_system();
+      
+      // Wait only for the peer we depend on
+      volatile int* peerCounter = stepCounters->GetPeerAs<int>(peerRank);
+      int expectedPeerStep = (worldSize - 1) + step;
+      while (*peerCounter < expectedPeerStep) {
+        // Busy wait for peer
       }
     }
     __syncthreads();
@@ -146,6 +162,7 @@ __global__ void RingAllReduceKernel(
 }
 
 // Single-launch Recursive Doubling AllReduce kernel
+// Each rank only waits for its partner rank by checking that rank's counter
 template <typename T>
 __global__ void RecursiveDoublingAllReduceKernel(
     SymmMemObj* workspace,
@@ -155,9 +172,12 @@ __global__ void RecursiveDoublingAllReduceKernel(
     int rank,
     int worldSize,
     ReduceOp op,
-    int* globalStepCounter) {
+    SymmMemObj* stepCounters) {
   
   size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  
+  // Get local step counter pointer
+  volatile int* myCounter = stepCounters->GetAs<int>();
   
   // Number of steps in recursive doubling
   int numSteps = 0;
@@ -178,13 +198,28 @@ __global__ void RecursiveDoublingAllReduceKernel(
     int partnerRank = rank ^ distance;
     
     // Skip if partner is out of bounds
-    if (partnerRank >= worldSize) continue;
+    if (partnerRank >= worldSize) {
+      // Still need to update counter for ranks waiting on us
+      if (threadIdx.x == 0 && blockIdx.x == 0) {
+        __threadfence_system();
+        atomicAdd((int*)myCounter, 1);
+        __threadfence_system();
+      }
+      __syncthreads();
+      continue;
+    }
     
-    // Synchronize with partner
+    // Memory fence and synchronize with partner
     if (threadIdx.x == 0 && blockIdx.x == 0) {
-      atomicAdd(globalStepCounter, 1);
-      while (atomicAdd(globalStepCounter, 0) < ((step + 1) * worldSize)) {
-        // Busy wait
+      __threadfence_system();
+      // Signal that we've completed this step
+      atomicAdd((int*)myCounter, 1);
+      __threadfence_system();
+      
+      // Wait only for our partner rank
+      volatile int* partnerCounter = stepCounters->GetPeerAs<int>(partnerRank);
+      while (*partnerCounter < (step + 1)) {
+        // Busy wait for partner
       }
     }
     __syncthreads();
