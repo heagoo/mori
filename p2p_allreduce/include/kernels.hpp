@@ -50,124 +50,133 @@ __global__ void RingAllReduceKernel(
     uintptr_t* stepCounterPeerPtrs)  // Device array of step counter peer pointers
 {
   size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  size_t stride = blockDim.x * gridDim.x;
   
-  // Get local and peer step counter pointers
+  // Get local step counter pointer
   volatile int* myCounter = GetPeerPtr<int>(stepCounterPeerPtrs, rank);
   
   // Get local workspace pointer
   T* localWorkspace = GetPeerPtr<T>(workspacePeerPtrs, rank);
   
+  // Get peer rank (the one we read from in the ring)
+  int peerRank = (rank - 1 + worldSize) % worldSize;
+  
+  // Step 0: Initialize workspace with sendbuf
+  for (size_t i = idx; i < count; i += stride) {
+    localWorkspace[i] = sendbuf[i];
+  }
+  __syncthreads();
+  
+  // Signal that data is ready and wait for peer to be ready
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    __threadfence_system();
+    atomicAdd((int*)myCounter, 1);  // Step 0 complete
+    __threadfence_system();
+    
+    // Wait for peer to finish initialization (step 0)
+    volatile int* peerCounter = GetPeerPtr<int>(stepCounterPeerPtrs, peerRank);
+    while (*peerCounter < 1) {
+      // Busy wait
+    }
+  }
+  __syncthreads();
+  
   // Phase 1: Reduce-Scatter
-  // Process all steps in a single kernel launch
-  for (int step = 1; step < worldSize; step++) {
-    // Calculate which chunk this rank is responsible for in this step
-    int recvRank = (rank - step + worldSize) % worldSize;
-    int recvChunk = (recvRank - 1 + worldSize) % worldSize;
+  // Each step, we reduce a different chunk from our peer into our workspace
+  for (int step = 0; step < worldSize - 1; step++) {
+    // Calculate which chunk we're working on in this step
+    // In ring reduce-scatter, each rank reduces the chunk that will eventually
+    // belong to rank (rank - step - 1 + worldSize) % worldSize
+    int chunkIdx = (rank - step - 1 + worldSize) % worldSize;
     
-    size_t chunkStart = recvChunk * chunkSize;
+    size_t chunkStart = chunkIdx * chunkSize;
     size_t chunkEnd = min(chunkStart + chunkSize, count);
-    size_t chunkCount = chunkEnd - chunkStart;
     
-    // Get pointer to peer's data (the rank we read from)
-    int peerRank = (rank - 1 + worldSize) % worldSize;
+    // Get peer's workspace pointer for this chunk
     const T* peerData = GetPeerPtr<T>(workspacePeerPtrs, peerRank) + chunkStart;
-    
-    // Local workspace
     T* localData = localWorkspace + chunkStart;
     
-    // If this is the first step, copy from sendbuf
-    if (step == 1 && idx < chunkCount) {
-      localData[idx] = sendbuf[chunkStart + idx];
-    }
-    __syncthreads();
-    
-    // Memory fence to ensure data is visible to other GPUs
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-      __threadfence_system();
-      // Signal that we've completed this step by updating our counter
-      atomicAdd((int*)myCounter, 1);
-      __threadfence_system();
-      
-      // Wait only for the peer we depend on (the one we read from)
-      volatile int* peerCounter = GetPeerPtr<int>(stepCounterPeerPtrs, peerRank);
-      while (*peerCounter < step) {
-        // Busy wait for peer to complete this step
+    // Reduce peer's data into our local workspace
+    for (size_t i = idx; i < chunkEnd - chunkStart; i += stride) {
+      T peerVal = peerData[i];
+      T localVal = localData[i];
+      switch (op) {
+        case ReduceOp::SUM:
+        case ReduceOp::AVG:
+          localData[i] = localVal + peerVal;
+          break;
+        case ReduceOp::PROD:
+          localData[i] = localVal * peerVal;
+          break;
+        case ReduceOp::MIN:
+          localData[i] = (localVal < peerVal) ? localVal : peerVal;
+          break;
+        case ReduceOp::MAX:
+          localData[i] = (localVal > peerVal) ? localVal : peerVal;
+          break;
       }
     }
     __syncthreads();
     
-    // Reduce from peer
-    if (idx < chunkCount) {
-      T val = peerData[idx];
-      switch (op) {
-        case ReduceOp::SUM:
-          localData[idx] += val;
-          break;
-        case ReduceOp::PROD:
-          localData[idx] *= val;
-          break;
-        case ReduceOp::MIN:
-          localData[idx] = (localData[idx] < val) ? localData[idx] : val;
-          break;
-        case ReduceOp::MAX:
-          localData[idx] = (localData[idx] > val) ? localData[idx] : val;
-          break;
-        case ReduceOp::AVG:
-          localData[idx] += val;
-          break;
+    // Signal step completion and wait for peer
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+      __threadfence_system();
+      atomicAdd((int*)myCounter, 1);  // Step (step+1) complete
+      __threadfence_system();
+      
+      // Wait for peer to finish this step
+      volatile int* peerCounter = GetPeerPtr<int>(stepCounterPeerPtrs, peerRank);
+      while (*peerCounter < (step + 2)) {
+        // Busy wait
       }
     }
     __syncthreads();
   }
   
   // Phase 2: AllGather
-  for (int step = 1; step < worldSize; step++) {
-    // Calculate which chunk to send/receive
-    int sendChunk = (rank - step + 1 + worldSize) % worldSize;
+  // Each step, we copy a fully-reduced chunk from our peer to our workspace
+  for (int step = 0; step < worldSize - 1; step++) {
+    // Calculate which chunk to gather in this step
+    // Each rank has its fully reduced chunk at index = rank
+    // In allgather, we copy from peer's chunk (peerRank - step + worldSize) % worldSize
+    int chunkIdx = (rank - step - 2 + 2 * worldSize) % worldSize;
     
-    size_t chunkStart = sendChunk * chunkSize;
+    size_t chunkStart = chunkIdx * chunkSize;
     size_t chunkEnd = min(chunkStart + chunkSize, count);
-    size_t chunkCount = chunkEnd - chunkStart;
     
-    // Get pointer to peer's data
-    int peerRank = (rank - 1 + worldSize) % worldSize;
+    // Get peer's workspace pointer for this chunk
     const T* peerData = GetPeerPtr<T>(workspacePeerPtrs, peerRank) + chunkStart;
+    T* localData = localWorkspace + chunkStart;
     
-    // Memory fence and signal completion, then wait for peer
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-      __threadfence_system();
-      // Signal that we've completed this allgather step
-      atomicAdd((int*)myCounter, 1);
-      __threadfence_system();
-      
-      // Wait only for the peer we depend on
-      volatile int* peerCounter = GetPeerPtr<int>(stepCounterPeerPtrs, peerRank);
-      int expectedPeerStep = (worldSize - 1) + step;
-      while (*peerCounter < expectedPeerStep) {
-        // Busy wait for peer
-      }
+    // Copy peer's fully-reduced chunk to our workspace
+    for (size_t i = idx; i < chunkEnd - chunkStart; i += stride) {
+      localData[i] = peerData[i];
     }
     __syncthreads();
     
-    // Copy to local recvbuf
-    if (idx < chunkCount) {
-      recvbuf[chunkStart + idx] = peerData[idx];
+    // Signal step completion and wait for peer
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+      __threadfence_system();
+      atomicAdd((int*)myCounter, 1);  // Allgather step complete
+      __threadfence_system();
+      
+      // Wait for peer to finish this step
+      volatile int* peerCounter = GetPeerPtr<int>(stepCounterPeerPtrs, peerRank);
+      int expectedStep = worldSize + step + 1;
+      while (*peerCounter < expectedStep) {
+        // Busy wait
+      }
     }
     __syncthreads();
   }
   
-  // Copy final result (my reduced chunk) to recvbuf
-  int myChunk = rank;
-  size_t chunkStart = myChunk * chunkSize;
-  size_t chunkEnd = min(chunkStart + chunkSize, count);
-  size_t chunkCount = chunkEnd - chunkStart;
-  
-  if (idx < chunkCount) {
-    T val = localWorkspace[chunkStart + idx];
+  // Copy final result from workspace to recvbuf
+  for (size_t i = idx; i < count; i += stride) {
+    T val = localWorkspace[i];
     if (op == ReduceOp::AVG) {
       val /= static_cast<T>(worldSize);
     }
-    recvbuf[chunkStart + idx] = val;
+    recvbuf[i] = val;
   }
 }
 
@@ -186,6 +195,7 @@ __global__ void RecursiveDoublingAllReduceKernel(
     uintptr_t* stepCounterPeerPtrs)  // Device array of step counter peer pointers
 {
   size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  size_t stride = blockDim.x * gridDim.x;
   
   // Get local step counter pointer
   volatile int* myCounter = GetPeerPtr<int>(stepCounterPeerPtrs, rank);
@@ -201,9 +211,17 @@ __global__ void RecursiveDoublingAllReduceKernel(
     temp >>= 1;
   }
   
-  // Initialize workspace with sendbuf
-  if (idx < count) {
-    localWorkspace[idx] = sendbuf[idx];
+  // Step 0: Initialize workspace with sendbuf
+  for (size_t i = idx; i < count; i += stride) {
+    localWorkspace[i] = sendbuf[i];
+  }
+  __syncthreads();
+  
+  // Signal initialization complete and wait for all peers
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    __threadfence_system();
+    atomicAdd((int*)myCounter, 1);  // Step 0 complete
+    __threadfence_system();
   }
   __syncthreads();
   
@@ -223,14 +241,8 @@ __global__ void RecursiveDoublingAllReduceKernel(
       continue;
     }
     
-    // Memory fence and synchronize with partner
+    // Wait for partner to be ready for this step
     if (threadIdx.x == 0 && blockIdx.x == 0) {
-      __threadfence_system();
-      // Signal that we've completed this step
-      atomicAdd((int*)myCounter, 1);
-      __threadfence_system();
-      
-      // Wait only for our partner rank
       volatile int* partnerCounter = GetPeerPtr<int>(stepCounterPeerPtrs, partnerRank);
       while (*partnerCounter < (step + 1)) {
         // Busy wait for partner
@@ -238,39 +250,45 @@ __global__ void RecursiveDoublingAllReduceKernel(
     }
     __syncthreads();
     
-    if (idx < count) {
-      // Get pointer to partner's data
-      const T* partnerData = GetPeerPtr<T>(workspacePeerPtrs, partnerRank);
-      
-      T val = partnerData[idx];
+    // Reduce partner's data into our workspace
+    const T* partnerData = GetPeerPtr<T>(workspacePeerPtrs, partnerRank);
+    for (size_t i = idx; i < count; i += stride) {
+      T peerVal = partnerData[i];
+      T localVal = localWorkspace[i];
       switch (op) {
         case ReduceOp::SUM:
-          localWorkspace[idx] += val;
+        case ReduceOp::AVG:
+          localWorkspace[i] = localVal + peerVal;
           break;
         case ReduceOp::PROD:
-          localWorkspace[idx] *= val;
+          localWorkspace[i] = localVal * peerVal;
           break;
         case ReduceOp::MIN:
-          localWorkspace[idx] = (localWorkspace[idx] < val) ? localWorkspace[idx] : val;
+          localWorkspace[i] = (localVal < peerVal) ? localVal : peerVal;
           break;
         case ReduceOp::MAX:
-          localWorkspace[idx] = (localWorkspace[idx] > val) ? localWorkspace[idx] : val;
-          break;
-        case ReduceOp::AVG:
-          localWorkspace[idx] += val;
+          localWorkspace[i] = (localVal > peerVal) ? localVal : peerVal;
           break;
       }
+    }
+    __syncthreads();
+    
+    // Signal step completion
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+      __threadfence_system();
+      atomicAdd((int*)myCounter, 1);  // Step (step+1) complete
+      __threadfence_system();
     }
     __syncthreads();
   }
   
   // Copy final result to recvbuf
-  if (idx < count) {
-    T val = localWorkspace[idx];
+  for (size_t i = idx; i < count; i += stride) {
+    T val = localWorkspace[i];
     if (op == ReduceOp::AVG) {
       val /= static_cast<T>(worldSize);
     }
-    recvbuf[idx] = val;
+    recvbuf[i] = val;
   }
 }
 
