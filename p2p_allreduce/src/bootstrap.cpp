@@ -30,7 +30,7 @@ namespace p2p_allreduce {
 MPIBootstrap::MPIBootstrap() {}
 
 MPIBootstrap::~MPIBootstrap() {
-  if (initialized_) {
+  if (initialized_ && shouldFinalize_) {
     Finalize();
   }
 }
@@ -38,9 +38,18 @@ MPIBootstrap::~MPIBootstrap() {
 void MPIBootstrap::Initialize() {
   if (initialized_) return;
   
-  int provided;
-  MPI_Init_thread(nullptr, nullptr, MPI_THREAD_MULTIPLE, &provided);
-  assert(provided >= MPI_THREAD_SERIALIZED);
+  // Check if MPI is already initialized by someone else
+  int mpiInitialized = 0;
+  MPI_Initialized(&mpiInitialized);
+  
+  if (!mpiInitialized) {
+    int provided;
+    MPI_Init_thread(nullptr, nullptr, MPI_THREAD_MULTIPLE, &provided);
+    assert(provided >= MPI_THREAD_SERIALIZED);
+    shouldFinalize_ = true;  // We initialized MPI, so we should finalize it
+  } else {
+    shouldFinalize_ = false;  // MPI was already initialized, don't finalize
+  }
   
   MPI_Comm_size(MPI_COMM_WORLD, &worldSize_);
   MPI_Comm_rank(MPI_COMM_WORLD, &rank_);
@@ -51,7 +60,15 @@ void MPIBootstrap::Initialize() {
 void MPIBootstrap::Finalize() {
   if (!initialized_) return;
   
-  MPI_Finalize();
+  // Only finalize MPI if we were the one who initialized it
+  if (shouldFinalize_) {
+    int mpiFinalized = 0;
+    MPI_Finalized(&mpiFinalized);
+    if (!mpiFinalized) {
+      MPI_Finalize();
+    }
+  }
+  
   initialized_ = false;
 }
 

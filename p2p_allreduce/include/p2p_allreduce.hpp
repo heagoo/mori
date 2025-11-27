@@ -169,6 +169,7 @@ class MPIBootstrap : public Bootstrap {
   int worldSize_{0};
   int rank_{0};
   bool initialized_{false};
+  bool shouldFinalize_{false};  // Only true if we called MPI_Init
 };
 
 }  // namespace p2p_allreduce
