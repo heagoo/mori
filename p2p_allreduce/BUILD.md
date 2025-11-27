@@ -11,12 +11,14 @@
 - **ROCm**: Version 5.0 or later
   - Download from: https://rocm.docs.amd.com/
   - Install HIP runtime and development tools
+  - **hipcc compiler is required** for GPU kernel compilation
 - **MPI**: Any MPI implementation
   - OpenMPI 4.0+ (recommended)
   - MPICH 3.3+
   - Or vendor-specific MPI (e.g., Cray MPI)
 - **CMake**: Version 3.19 or later
 - **C++ Compiler**: GCC 9+ or Clang 10+ with C++17 support
+  - Note: GPU kernel files are compiled with hipcc, not the standard C++ compiler
 
 ## Installation Steps
 
@@ -104,7 +106,7 @@ rocm-smi --showtopoinfo
 cd p2p_allreduce
 mkdir build && cd build
 
-# Configure
+# Configure (CMake will use hipcc for GPU kernel files)
 cmake .. \
   -DCMAKE_BUILD_TYPE=Release \
   -DROCM_PATH=/opt/rocm
@@ -115,6 +117,11 @@ make -j$(nproc)
 # Optional: Install
 sudo make install
 ```
+
+**Note**: The CMake configuration automatically:
+- Enables HIP language support (`LANGUAGES CXX HIP`)
+- Sets source files with GPU kernels to compile with hipcc via `set_source_files_properties(... PROPERTIES LANGUAGE HIP)`
+- Links against `hip::device` and `hip::host` for GPU support
 
 ## Build Options
 
